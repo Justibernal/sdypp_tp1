@@ -2,7 +2,6 @@
 
 ## Grupo
 
-<!-- TODO: definir nombre del grupo -->
 
 ## Integrantes
 
@@ -12,4 +11,4 @@
 
 ## Lenguaje
 
-Python
+
