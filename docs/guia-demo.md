@@ -61,6 +61,75 @@ Y hay que **avisarles tres cosas** sobre nuestras réplicas:
 
 ---
 
+## El problema real: que su balanceador NOS ALCANCE
+
+Nuestras réplicas corren en la Mac de casa, en `localhost:8121` y `localhost:8122`. Desde
+otra casa **eso no se alcanza**. Hay que resolverlo, y hay tres caminos, de mejor a peor:
+
+### Opción A — Tailscale (la que pide el enunciado)
+
+Las dos máquinas entran al mismo tailnet y su balanceador nos alcanza por nombre, sin abrir
+puertos al mundo.
+
+```bash
+tailscale status                    # confirmar que estamos en el tailnet del grupo
+tailscale ip -4                     # la IP que hay que darle
+sudo ufw allow in on tailscale0 to any port 8121 proto tcp   # sólo en Linux
+```
+
+Le pasamos `casa-justino:8121` y `casa-justino:8122`.
+
+### Opción B — túnel TCP
+
+Si Tailscale no sale. **Tiene que ser túnel TCP, no HTTP**: el túnel HTTP del plan free de
+ngrok no sirve para gRPC sin TLS end-to-end.
+
+```bash
+ngrok tcp 8121
+```
+
+**Limitación:** el plan free da **un solo túnel a la vez**, y nosotros tenemos dos réplicas.
+O se paga, o se expone una sola —y ahí perdemos parte del reparto.
+
+### Opción C — le pasamos la imagen y las corre él
+
+La más confiable si la red no sale. Nuestra app es una imagen Docker: se la mandamos y él
+levanta dos réplicas Java al lado de las Python.
+
+```bash
+docker save sdypp-app-java:local | gzip > app-java.tar.gz     # ~90 MB comprimido
+# él, del otro lado:
+gunzip -c app-java.tar.gz | docker load
+docker run -d --name java-1 -p 8121:8080 \
+  -e HOST_NAME=java-1 -e CASA=casa-plataforma \
+  -e TP_REDIS_URL=<la-url-de-la-base> sdypp-app-java:local
+```
+
+**Lo que se pierde y hay que decirlo:** las réplicas ya no están en nuestra casa, así que no
+se prueba la red entre casas ni la latencia real. Pero el pool **sí** queda mixto Java+Python
+detrás de un solo balanceador, que es el punto de la Etapa 2.
+
+---
+
+## Árbol de decisión para mañana
+
+```
+¿Tomás tiene el balanceador andando?
+├── SÍ ──► ¿nos alcanza desde su máquina?
+│          ├── SÍ (Tailscale o túnel) ──► DEMO COMPLETA. Nuestro conmutador queda apagado.
+│          └── NO ──► Opción C: le pasamos la imagen, corre él las réplicas Java.
+└── NO ───► PLAN B: nuestro conmutador. Se dice en voz alta qué se pierde.
+```
+
+En los tres casos **nuestro código es el mismo**. Lo único que cambia:
+
+```bash
+URL=<la-que-den>                        # en vez de localhost:8080
+CONMUTADOR_ADMIN=<su-endpoint>          # en vez de http://localhost:9090/backends
+```
+
+---
+
 ## Lo que les damos a ellos
 
 ```
