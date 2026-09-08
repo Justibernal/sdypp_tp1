@@ -166,7 +166,9 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | ✅ | `deploy.sh` blue-green con abort y rollback | 4 escenarios probados end-to-end |
 | ✅ | Conmutador propio (**Plan B**) con round-robin y health checks gRPC | Reparto 50/50 exacto |
 | ✅ | Deploy v5→v6 con un loop de 6000 requests corriendo | **6000/6000 OK, 0 perdidas** |
+| ✅ | Deploy **y rollback** con un loop de 12000 requests corriendo | **12000/12000 OK, 0 perdidas** · las dos versiones en el reparto |
 | ✅ | Réplica muerta → sale de rotación, el loop sigue | 100/100 OK con una réplica caída |
+| ✅ | Los siete momentos de la demo, en una segunda casa y otro SO | Windows + Git Bash; 2 fallas de portabilidad encontradas y cerradas |
 | ⬜ | Réplicas repartidas entre las tres casas (Tailscale) | |
 | ✅ | Diagramas: arquitectura por etapa, flujo del deploy y secuencias | [`docs/diagramas.md`](docs/diagramas.md) |
 | ✅ | Auditoría punto por punto contra el contrato v2.2 | 2 huecos encontrados y cerrados |
@@ -187,6 +189,21 @@ Las imágenes sueltas están en `docs/img/` (PNG y SVG, para pegar en la present
 python3 docs/render.py    # regenera el .html
 npx -p @mermaid-js/mermaid-cli mmdc -i docs/diagramas.md -o docs/img/diagramas.md -e png -b white -w 1600
 ```
+
+---
+
+## Mejoras al enunciado
+
+Las cuatro están en [`docs/mejoras-al-enunciado.md`](docs/mejoras-al-enunciado.md). Ninguna es de
+redacción: salieron de medir o de que nos costaron tiempo.
+
+1. **"Menos de cien líneas" presupone HTTP/1.1.** Con gRPC el balanceador tiene que elegir entre
+   L4 y L7, y el enunciado no obliga a declarar cuál ni qué se pierde.
+2. **La auditoría se pide por timestamp y el propio enunciado dice que los relojes mienten.**
+   Falta un id de correlación en el contrato de logging.
+3. **Pide health checks pero no define los umbrales.** Ni cuántos fallos expulsan, ni cuántos
+   aciertos reincorporan, ni por qué no son el mismo número.
+4. **Elimina tres SPOFs e introduce uno nuevo —la base— y lo menciona al final, como curiosidad.**
 
 ---
 
@@ -263,6 +280,21 @@ ese ritmo mide el kernel, no el servicio. El verificador acepta una pausa por es
 
 A 65 req/s, que es un ritmo de demo honesto: **6000 de 6000, cero perdidas**, con un deploy
 completo y un rollback en el medio.
+
+La corrida más larga se hizo después, en la segunda casa (Windows + Git Bash) y a 57 req/s:
+**12000 de 12000, cero perdidas**, también con un deploy y un rollback en el medio. El reparto
+final deja ver la ventana entera en un solo cuadro:
+
+```
+java@casa-agustina-blue-1  v8   5454  (45,5%)
+java@casa-agustina-blue-2  v8   5456  (45,5%)
+java@casa-agustina-green-1 v9    545   (4,5%)
+java@casa-agustina-green-2 v9    545   (4,5%)
+```
+
+Las verdes v9 son exactamente el tiempo que estuvieron sirviendo, entre la conmutación y el
+rollback. **Ninguna de las 12000 requests cayó en ese cambio de manos**, que es lo que la
+Etapa 1 tiene que demostrar.
 
 ### El hallazgo que anticipa el contrato (§7.3)
 
