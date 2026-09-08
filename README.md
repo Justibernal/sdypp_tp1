@@ -168,7 +168,52 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | ✅ | Deploy v5→v6 con un loop de 6000 requests corriendo | **6000/6000 OK, 0 perdidas** |
 | ✅ | Réplica muerta → sale de rotación, el loop sigue | 100/100 OK con una réplica caída |
 | ⬜ | Réplicas repartidas entre las tres casas (Tailscale) | |
-| ⬜ | Diagramas de arquitectura por etapa | |
+| ✅ | Diagramas: arquitectura por etapa, flujo del deploy y secuencias | [`docs/diagramas.md`](docs/diagramas.md) |
+| ✅ | Auditoría punto por punto contra el contrato v2.2 | 2 huecos encontrados y cerrados |
+
+---
+
+## Diagramas
+
+En [`docs/diagramas.md`](docs/diagramas.md) — GitHub los renderiza solo. Son siete:
+arquitectura de las Etapas 1, 2 y 3; el flujo del deploy con abort y rollback; la secuencia
+del reparto con ejección por health check; la del alta atómica con dos réplicas
+compitiendo; y el hallazgo del L4.
+
+Las imágenes sueltas están en `docs/img/` (PNG y SVG, para pegar en la presentación) y
+`docs/diagramas.html` es un visor para proyectar. Los tres salen del mismo `.md`:
+
+```bash
+python3 docs/render.py    # regenera el .html
+npx -p @mermaid-js/mermaid-cli mmdc -i docs/diagramas.md -o docs/img/diagramas.md -e png -b white -w 1600
+```
+
+---
+
+## Auditoría contra el contrato
+
+Se verificó punto por punto, con el sistema corriendo. Todo lo de §1 a §6 pasa: nombre del
+servicio (`sdypp.Servicio`), precedencia del puerto (arg CLI > `PORT` > 8080), zona horaria
+fija (con `TZ=UTC` el `arrancado` sigue saliendo en `-03:00`), los cinco RPC, la matriz de
+validación completa, el esquema de claves de Redis tal cual, el formato de bitácora (cero
+líneas fuera de formato, errores incluidos), un archivo por réplica, contenedor no-root,
+puerto interno 8080 y `HEALTHCHECK` contra el health estándar.
+
+**Aparecieron dos huecos, los dos cerrados:**
+
+**1. La gracia del contenedor no estaba garantizada.** El contrato (§6) pide que el plazo del
+contenedor sea mayor que el `grace` del servidor, o el `SIGKILL` llega en medio del drenado.
+Teníamos `grace` = 10 s y el `deploy.sh` pasa `--stop-timeout 15` — pero el default de
+`docker stop` es 10 s, no hay instrucción de Dockerfile que lo cambie, y esta versión de
+Docker ni siquiera reporta `StopTimeout` en `docker inspect`, así que no se puede verificar
+que el flag se haya aplicado. Se bajó el `grace` del servidor a **8 s** (`TP_GRACE`): ahora
+la regla se cumple sola aunque nadie pase el flag.
+
+**2. Exponíamos una sola versión del protocolo de reflection.** La App Python expone la
+**v1alpha** (`grpc_reflection.v1alpha`) y nosotros sólo la **v1**. Los `grpcurl` viejos hablan
+únicamente v1alpha: el verificador del equipo cruzado podría no vernos por una diferencia que
+no tiene nada que ver con nuestro servicio. Ahora se registran las dos, verificado con un
+cliente de reflection propio contra ambas.
 
 ---
 

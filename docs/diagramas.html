@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<title>Diagramas · App Java · SDyPP</title>
+<style>
+  body { font: 16px/1.6 -apple-system, system-ui, sans-serif; max-width: 1100px;
+         margin: 0 auto; padding: 2rem; color: #1f2328; background: #fff; }
+  h1 { font-size: 2rem; border-bottom: 2px solid #d0d7de; padding-bottom: .4rem; }
+  h2 { font-size: 1.4rem; margin-top: 2.5rem; color: #0969da; }
+  hr { border: 0; border-top: 1px solid #d0d7de; margin: 2.5rem 0; }
+  code { background: #f0f1f3; padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  .mermaid { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 8px;
+              padding: 1.2rem; margin: 1.2rem 0; text-align: center; overflow-x: auto; }
+  @media print { .mermaid { page-break-inside: avoid; } }
+</style></head><body>
+<h1>Diagramas — App Java · Tarea Clase 2</h1>
+<p>Cinco diagramas: la arquitectura de cada etapa, el flujo del deploy y las dos secuencias</p>
+<p>que explican por qué el sistema aguanta. Lo que está implementado y medido va en línea</p>
+<p>llena; lo propuesto, punteado.</p>
+<hr>
+<h2>1 · Arquitectura — Etapa 1: un conmutador, dos colores</h2>
+<p>Termina la pelea por el puerto: una sola URL pública, y detrás dos versiones conviviendo.</p>
+<pre class="mermaid">flowchart LR
+    CLI[&quot;Cliente gRPC&lt;br/&gt;(verificador)&quot;]
+
+    CONM[&quot;CONMUTADOR&lt;br/&gt;:8080 plano de datos (TCP)&lt;br/&gt;:9090 plano de control (HTTP)&quot;]
+
+    subgraph AZUL [&quot;AZUL — versión que sirve&quot;]
+        B1[&quot;réplica blue-1&lt;br/&gt;:8111 · v5&quot;]
+        B2[&quot;réplica blue-2&lt;br/&gt;:8112 · v5&quot;]
+    end
+
+    subgraph VERDE [&quot;VERDE — versión nueva, al lado&quot;]
+        G1[&quot;réplica green-1&lt;br/&gt;:8121 · v6&quot;]
+        G2[&quot;réplica green-2&lt;br/&gt;:8122 · v6&quot;]
+    end
+
+    REDIS[(&quot;Redis&lt;br/&gt;estado compartido&quot;)]
+    DEP[&quot;deploy.sh&quot;]
+
+    CLI --&gt;|&quot;una única URL&quot;| CONM
+    CONM ==&gt;|&quot;apunta acá&quot;| B1
+    CONM ==&gt; B2
+    CONM -.-&gt;|&quot;tras conmutar&quot;| G1
+    CONM -.-&gt; G2
+
+    B1 --&gt; REDIS
+    B2 --&gt; REDIS
+    G1 --&gt; REDIS
+    G2 --&gt; REDIS
+
+    DEP --&gt;|&quot;POST /backends&lt;br/&gt;sin reiniciar&quot;| CONM
+
+    classDef activo fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef espera fill:#2ea043,stroke:#12511f,color:#fff
+    classDef infra fill:#6e7681,stroke:#30363d,color:#fff
+    class B1,B2 activo
+    class G1,G2 espera
+    class CONM,DEP,REDIS infra
+</pre>
+<p><strong>Lo que importa:</strong> el conmutador tiene <strong>dos planos separados</strong>. El de datos reenvía bytes;</p>
+<p>el de control escucha aparte, en <code>127.0.0.1</code>. Esa separación es lo que permite cambiar de</p>
+<p>destino <strong>sin reiniciar</strong> — el deploy le habla al control mientras el de datos sigue</p>
+<p>atendiendo.</p>
+<hr>
+<h2>2 · Arquitectura — Etapa 2: pool mixto y health checks</h2>
+<p>El conmutador ya no apunta a un backend: conoce una lista, rota entre ella, y saca de</p>
+<p>rotación a la que deja de responder.</p>
+<pre class="mermaid">flowchart TB
+    CLI[&quot;Clientes gRPC&quot;] --&gt; BAL
+
+    BAL[&quot;BALANCEADOR&lt;br/&gt;round-robin sobre los SANOS&lt;br/&gt;AtomicInteger = sección crítica&lt;br/&gt;&lt;br/&gt;health cada 3 s · grpc.health.v1.Health&lt;br/&gt;3 fallos seguidos = fuera de rotación&quot;]
+
+    subgraph CJ [&quot;casa-justino&quot;]
+        J1[&quot;Java v7&lt;br/&gt;:8121&quot;]
+        J2[&quot;Java v7&lt;br/&gt;:8122&quot;]
+        LOGJ[&quot;bitácora local&lt;br/&gt;una por réplica&quot;]
+    end
+
+    subgraph CT [&quot;casa-tomas&quot;]
+        P1[&quot;Python&lt;br/&gt;:8080&quot;]
+    end
+
+    subgraph CS [&quot;casa-salvador&quot;]
+        P2[&quot;Python&lt;br/&gt;:8080&quot;]
+    end
+
+    BAL --&gt; J1
+    BAL --&gt; J2
+    BAL -.-&gt;|&quot;pendiente: Tailscale&quot;| P1
+    BAL -.-&gt;|&quot;pendiente: Tailscale&quot;| P2
+
+    REDIS[(&quot;Redis · casa-nomico&lt;br/&gt;personas:seq · persona:id&lt;br/&gt;personas:index · legajo:legajo&quot;)]
+
+    J1 --&gt; REDIS
+    J2 --&gt; REDIS
+    P1 -.-&gt; REDIS
+    P2 -.-&gt; REDIS
+
+    LOGB[&quot;bitácora del&lt;br/&gt;balanceador&lt;br/&gt;a quién derivó&quot;]
+    J1 --&gt; LOGJ
+    J2 --&gt; LOGJ
+    BAL --&gt; LOGB
+    LOGB -.-&gt;|&quot;se cruzan para auditar&lt;br/&gt;una operación puntual&quot;| LOGJ
+
+    classDef java fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef py fill:#8957e5,stroke:#4c2889,color:#fff
+    classDef infra fill:#6e7681,stroke:#30363d,color:#fff
+    classDef log fill:#9e6a03,stroke:#5c3d00,color:#fff
+    class J1,J2 java
+    class P1,P2 py
+    class BAL,REDIS infra
+    class LOGJ,LOGB log
+</pre>
+<p><strong>El estado no vive en las réplicas.</strong> Por eso una puede atender el alta y otra la lectura</p>
+<p>siguiente, y por eso la que se muere no se lleva nada consigo. El SPOF se mudó: ahora está</p>
+<p>en Redis.</p>
+<hr>
+<h2>3 · Arquitectura — Etapa 3: replicar al balanceador (propuesta)</h2>
+<pre class="mermaid">flowchart TB
+    CLI[&quot;Cliente&quot;] --&gt;|&quot;¿a cuál le habla?&lt;br/&gt;← el problema nuevo&quot;| VIP
+
+    VIP{{&quot;punto de entrada único&lt;br/&gt;DNS / IP virtual / túnel&quot;}}
+
+    VIP --&gt; BAL1[&quot;balanceador A&lt;br/&gt;LÍDER&quot;]
+    VIP -.-&gt; BAL2[&quot;balanceador B&lt;br/&gt;en espera&quot;]
+
+    BAL1 &lt;-.-&gt;|&quot;latido&lt;br/&gt;¿sigue vivo?&quot;| BAL2
+
+    BAL1 --&gt; POOL[&quot;pool de réplicas&quot;]
+    BAL2 -.-&gt; POOL
+
+    SPLIT[&quot;si se corta el enlace&lt;br/&gt;los dos se creen líderes&lt;br/&gt;&lt;b&gt;split-brain&lt;/b&gt;&quot;]
+    BAL1 -.- SPLIT
+    BAL2 -.- SPLIT
+
+    classDef prop fill:#30363d,stroke:#8b949e,color:#fff,stroke-dasharray: 5 5
+    classDef riesgo fill:#da3633,stroke:#8b0000,color:#fff
+    class VIP,BAL1,BAL2,POOL prop
+    class SPLIT riesgo
+</pre>
+<p>Replicar el balanceador no cierra el problema, lo <strong>corre de lugar</strong>: aparece el split-brain</p>
+<p>y la pregunta de quién balancea a los balanceadores. En algún punto la cadena se corta con</p>
+<p>algo que el cliente ya sabe encontrar solo — DNS, una IP virtual, un túnel.</p>
+<hr>
+<h2>4 · Flujo del deploy blue-green — con abort y rollback</h2>
+<pre class="mermaid">flowchart TD
+    START([&quot;cambio en el código&lt;br/&gt;Config.VERSION sube&quot;]) --&gt; BUILD
+
+    BUILD[&quot;BUILD&lt;br/&gt;docker build multi-stage&lt;br/&gt;tag = vN-commit(-sucio)&quot;] --&gt; ARRIBA
+
+    ARRIBA[&quot;ARRIBA&lt;br/&gt;las N réplicas del color LIBRE&lt;br/&gt;todas a la vez, en otro puerto&quot;] --&gt; VSANA
+
+    VSANA{&quot;VERIFY 1&lt;br/&gt;¿todas healthy?&quot;}
+    VSANA --&gt;|&quot;no&quot;| ABORT
+    VSANA --&gt;|&quot;sí&quot;| VVER
+
+    VVER{&quot;VERIFY 2&lt;br/&gt;¿todas sirven la&lt;br/&gt;versión declarada?&quot;}
+    VVER --&gt;|&quot;no — ship a medias&quot;| ABORT
+    VVER --&gt;|&quot;sí&quot;| CONM
+
+    ABORT[&quot;ABORTA&lt;br/&gt;baja TODAS las nuevas&lt;br/&gt;NO conmuta · exit 1&lt;br/&gt;las viejas nunca dejaron de servir&quot;]
+
+    CONM[&quot;CONMUTAR&lt;br/&gt;POST /backends al conmutador&lt;br/&gt;sin reiniciarlo&quot;] --&gt; OK
+
+    OK([&quot;sirviendo la versión nueva&lt;br/&gt;la vieja QUEDA VIVA al lado&quot;])
+    OK -.-&gt;|&quot;si algo sale mal después&quot;| RB[&quot;ROLLBACK&lt;br/&gt;volver a apuntar a la vieja&lt;br/&gt;un solo comando&quot;]
+
+    style VSANA fill:#d29922,stroke:#7d4e00,color:#111
+    style VVER fill:#d29922,stroke:#7d4e00,color:#111
+    style ABORT fill:#da3633,stroke:#8b0000,color:#fff
+    style RB fill:#da3633,stroke:#8b0000,color:#fff
+    style OK fill:#2ea043,stroke:#12511f,color:#fff
+</pre>
+<p><strong>Dos verificaciones, no una.</strong> El health check dice &quot;estoy vivo&quot;, no &quot;soy la versión que</p>
+<p>pediste&quot;: un ship a medias deja un contenedor perfectamente sano corriendo la versión</p>
+<p>anterior. Por eso el segundo verify compara la versión que responde <code>Identidad</code> contra la</p>
+<p>declarada en el código.</p>
+<p><strong>La vieja no se baja al conmutar.</strong> Volver atrás tiene que ser un comando, no un deploy en</p>
+<p>reversa.</p>
+<hr>
+<h2>5 · Secuencia — reparto, muerte de una réplica y ejección</h2>
+<pre class="mermaid">sequenceDiagram
+    autonumber
+    participant C as Cliente
+    participant B as Balanceador
+    participant R1 as réplica 1
+    participant R2 as réplica 2
+    participant DB as Redis
+
+    Note over B,R2: cada 3 s, en paralelo al tráfico
+    B-&gt;&gt;R1: grpc.health.v1.Health
+    R1--&gt;&gt;B: SERVING
+    B-&gt;&gt;R2: grpc.health.v1.Health
+    R2--&gt;&gt;B: SERVING
+
+    C-&gt;&gt;B: CrearPersona
+    B-&gt;&gt;R1: reenvía (round-robin)
+    R1-&gt;&gt;DB: script Lua atómico
+    DB--&gt;&gt;R1: id = 7
+    R1--&gt;&gt;C: OK · id 7 · servidoPor java
+
+    C-&gt;&gt;B: ListarPersonas
+    B-&gt;&gt;R2: reenvía (le toca a la otra)
+    R2-&gt;&gt;DB: ZRANGE + HGETALL
+    DB--&gt;&gt;R2: incluye el id 7
+    R2--&gt;&gt;C: la persona está
+
+    Note over R1: la réplica 1 muere
+
+    B-&gt;&gt;R1: health check
+    R1--xB: sin respuesta (fallo 1)
+    B-&gt;&gt;R1: health check
+    R1--xB: sin respuesta (fallo 2)
+    B-&gt;&gt;R1: health check
+    R1--xB: sin respuesta (fallo 3)
+    Note over B: 3 seguidos → fuera de rotación
+
+    C-&gt;&gt;B: ListarPersonas
+    B-&gt;&gt;R2: todo a la que queda
+    R2--&gt;&gt;C: OK · los datos siguen estando
+</pre>
+<p><strong>Por qué 3 fallos y no 1:</strong> con umbral 1, un pico de latencia o un GC bastan para expulsar</p>
+<p>una réplica sana. Nos pasó: bajo carga los chequeos se pasaban de deadline y el pool quedaba</p>
+<p>vacío <strong>con las dos réplicas perfectamente vivas</strong>. Expulsar rápido es caro porque achica el</p>
+<p>pool; reincorporar rápido es barato, así que alcanza <strong>un</strong> acierto para volver.</p>
+<hr>
+<h2>6 · Secuencia — dos réplicas dando de alta el mismo legajo</h2>
+<pre class="mermaid">sequenceDiagram
+    autonumber
+    participant A as réplica Java
+    participant P as réplica Python
+    participant R as Redis (mono-hilo)
+
+    par al mismo tiempo
+        A-&gt;&gt;R: EVAL alta_persona · legajo 100200
+    and
+        P-&gt;&gt;R: EVAL alta_persona · legajo 100200
+    end
+
+    Note over R: Redis ejecuta un script&lt;br/&gt;entero sin intercalar otros
+
+    R-&gt;&gt;R: EXISTS legajo:100200 → no
+    R-&gt;&gt;R: INCR personas:seq → 7
+    R-&gt;&gt;R: HSET persona:7 · ZADD index · SET legajo:100200
+    R--&gt;&gt;A: 7
+
+    R-&gt;&gt;R: EXISTS legajo:100200 → SÍ
+    R--&gt;&gt;P: -1
+
+    A--&gt;&gt;A: OK · id 7
+    P--&gt;&gt;P: ALREADY_EXISTS
+</pre>
+<p><strong>Sin atomicidad, las dos ganan.</strong> Entre comprobar que el legajo no está y escribirlo, la</p>
+<p>otra réplica se cuela; y entre pedir el <code>id</code> y usarlo, la otra pide el mismo. Redis corre el</p>
+<p>script entero sin intercalar comandos de otros clientes, así que las cinco operaciones valen</p>
+<p>por una — y eso nos ahorra coordinar las casas entre sí.</p>
+<p><strong>Medido:</strong> 25 altas del mismo legajo lanzadas a la vez desde una barrera común →</p>
+<p><strong>1 <code>OK</code> y 24 <code>ALREADY_EXISTS</code></strong>.</p>
+<hr>
+<h2>7 · El hallazgo: L4 reparte por conexión, no por RPC</h2>
+<pre class="mermaid">flowchart TB
+    subgraph A [&quot;❌ cliente gRPC real — un canal compartido&quot;]
+        CA[&quot;cliente&quot;] --&gt;|&quot;una conexión TCP&lt;br/&gt;N RPC multiplexados&quot;| BA[&quot;balanceador L4&quot;]
+        BA --&gt;|&quot;elige UNA VEZ&quot;| RA[&quot;réplica 1&lt;br/&gt;100 %&quot;]
+        BA -.-&gt;|&quot;nunca&quot;| RB2[&quot;réplica 2&lt;br/&gt;0 %&quot;]
+    end
+
+    subgraph B [&quot;✅ N clientes distintos — un canal por request&quot;]
+        CB[&quot;N clientes&quot;] --&gt;|&quot;N conexiones TCP&quot;| BB[&quot;balanceador L4&quot;]
+        BB --&gt;|&quot;elige por conexión&quot;| RC[&quot;réplica 1&lt;br/&gt;50 %&quot;]
+        BB --&gt; RD[&quot;réplica 2&lt;br/&gt;50 %&quot;]
+    end
+
+    classDef mal fill:#da3633,stroke:#8b0000,color:#fff
+    classDef bien fill:#2ea043,stroke:#12511f,color:#fff
+    class RA,RB2 mal
+    class RC,RD bien
+</pre>
+<p>Un balanceador <strong>L4 decide por conexión</strong>. Una conexión gRPC es persistente y multiplexada:</p>
+<p>el cliente abre un canal y manda todos sus RPC por ahí, así que queda pegado a una réplica.</p>
+<p>El contrato lo avisa en §7.3 — acá está medido: <strong>100 % a una sola réplica</strong> con canal</p>
+<p>compartido, <strong>50/50 exacto</strong> con canal por request.</p>
+<p>Repartir <strong>por RPC</strong> exige subir a L7 y entender HTTP/2. Es la decisión grande que le queda</p>
+<p>al equipo Plataforma.</p>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'default',
+  flowchart: { curve: 'basis', useMaxWidth: true } });</script>
+</body></html>

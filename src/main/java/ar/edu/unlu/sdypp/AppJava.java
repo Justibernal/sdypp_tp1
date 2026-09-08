@@ -6,6 +6,7 @@ import io.grpc.InsecureServerCredentials;
 import io.grpc.Server;
 import io.grpc.health.v1.HealthCheckResponse.ServingStatus;
 import io.grpc.protobuf.services.HealthStatusManager;
+import io.grpc.protobuf.services.ProtoReflectionService;
 import io.grpc.protobuf.services.ProtoReflectionServiceV1;
 
 import java.util.concurrent.ExecutorService;
@@ -26,8 +27,19 @@ import java.util.concurrent.TimeUnit;
  */
 public final class AppJava {
 
-    /** Segundos que se le dan a los RPC en curso antes de cortar. */
-    private static final int GRACIA_SEGUNDOS = 10;
+    /**
+     * Segundos que se le dan a los RPC en curso antes de cortar.
+     *
+     * 8 y no 10 a propósito: el contrato (§6) pide que el plazo de gracia del CONTENEDOR sea
+     * mayor que el del servidor, o el SIGKILL llega en medio del drenado y el graceful
+     * shutdown no sirve de nada. El default de `docker stop` es 10 s, y no hay instrucción de
+     * Dockerfile que lo cambie — sólo el flag `--stop-timeout` en el `docker run`, que puede
+     * olvidarse (y que esta versión de Docker ni siquiera reporta en `docker inspect`). Con 8
+     * la regla se cumple sola aunque nadie pase el flag; el deploy igual pasa 15 para tener
+     * más aire.
+     */
+    private static final int GRACIA_SEGUNDOS =
+            Integer.parseInt(System.getenv().getOrDefault("TP_GRACE", "8"));
 
     private AppJava() {
     }
@@ -53,7 +65,14 @@ public final class AppJava {
                 .addService(salud.getHealthService())
                 // Reflection: permite que otro equipo nos pruebe con grpcurl sin tener el
                 // .proto. Es lo que hace posible el verificador cruzado.
+                //
+                // Se registran las DOS versiones del protocolo. La App Python expone la
+                // v1alpha (grpc_reflection.v1alpha) y los grpcurl viejos sólo hablan esa; los
+                // nuevos prueban la v1 primero. Exponiendo una sola, el verificador del equipo
+                // cruzado podría no vernos por una diferencia que no tiene nada que ver con
+                // nuestro servicio.
                 .addService(ProtoReflectionServiceV1.newInstance())
+                .addService(ProtoReflectionService.newInstance())
                 .build()
                 .start();
 
