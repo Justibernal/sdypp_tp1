@@ -24,8 +24,8 @@ public final class Config {
      */
     public static final String[][] EQUIPO = {
             {"María Agustina", "Ortiz", "0"},
-            {"Justino", "Bernal", "0"},
-            {"Sebastián", "—", "0"},
+            {"Justino", "Bernal", "190118"},
+            {"Federico", "Kasparian", "0"},
     };
 
     /**
