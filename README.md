@@ -164,8 +164,73 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | ✅ | `SIGTERM` → `NOT_SERVING` → drenado → salida limpia | `docker stop` en 0,5 s |
 | ✅ | Contenedor no-root, `HEALTHCHECK` gRPC | `(healthy)` a los 20 s |
 | ✅ | `deploy.sh` blue-green con abort y rollback | 4 escenarios probados end-to-end |
+| ✅ | Conmutador propio (**Plan B**) con round-robin y health checks gRPC | Reparto 50/50 exacto |
+| ✅ | Deploy v5→v6 con un loop de 6000 requests corriendo | **6000/6000 OK, 0 perdidas** |
+| ✅ | Réplica muerta → sale de rotación, el loop sigue | 100/100 OK con una réplica caída |
 | ⬜ | Réplicas repartidas entre las tres casas (Tailscale) | |
 | ⬜ | Diagramas de arquitectura por etapa | |
+
+---
+
+## Plan B: el conmutador propio
+
+`ar.edu.unlu.sdypp.planb.Conmutador` — **no reemplaza al balanceador del equipo
+Plataforma**. Es el plan B que el enunciado permite declarar: nos deja demostrar las Etapas
+1 y 2 desde una sola máquina si la red entre casas, o el balanceador, no llegan.
+
+```bash
+CASA=casa-justino TP_LOGS=logs/conmutador \
+  java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.Conmutador 8080 9090 localhost:8111,localhost:8112
+
+curl -s localhost:9090/estado
+CONMUTADOR_ADMIN=http://localhost:9090/backends ./deploy/deploy.sh desplegar
+```
+
+**Plano de datos: proxy TCP (L4).** Reenvía bytes sin entender el protocolo. Un proxy gRPC
+real tendría que hablar HTTP/2 y multiplexar streams. Lo que se paga por el camino corto:
+la bitácora registra **conexiones**, no operaciones, y el reparto es **por conexión**.
+
+**Plano de control: HTTP/JSON**, con el `com.sun.net.httpserver` del JDK — el mismo de la
+App de la Clase 1. Separar los dos planos es lo que permite cambiar de destino **sin
+reiniciar**: el `deploy.sh` le habla al admin mientras el proxy sigue atendiendo. El admin
+escucha sólo en `127.0.0.1`: un POST a `/backends` redirige todo el tráfico del servicio.
+
+### Lo que rompimos y aprendimos midiendo
+
+**El balanceador se cayó solo bajo su propia carga: 59,2% de fallos.** No se cayó ninguna
+réplica — se cayó el balanceador. Tres causas, las tres reales:
+
+1. **Bitácora sincronizada a disco y `println` en cada conexión.** A ~1200 conexiones/s eso
+   es un candado global más una syscall por línea: el proxy pasaba más tiempo hablando con
+   el disco que reenviando bytes. Ahora el writer queda abierto y se vuelca cada segundo.
+2. **Un solo timeout bastaba para declarar muerto un backend.** Con la JVM ahogada, el
+   health check se pasaba de deadline y el pool quedaba vacío **con las dos réplicas
+   sanas**. Ahora hacen falta 3 fallos seguidos para expulsar, y 1 acierto para reincorporar:
+   expulsar rápido es caro porque achica el pool, reincorporar rápido es barato.
+3. **Un canal gRPC nuevo en cada chequeo**, cada 3 s por réplica: un handshake HTTP/2
+   completo cada vez. Ahora hay un canal por backend, abierto una vez.
+
+Con eso: **59,2% → 0,7% de fallos**. El 0,7% restante no era del balanceador: el verificador
+abría una conexión TCP por request a ~600/s y **desbordaba la cola de accept del sistema
+operativo** (`kern.ipc.somaxconn` = 128). El kernel rechazaba conexiones de réplicas
+perfectamente sanas. Un cliente gRPC real reusa el canal y nunca se comporta así — medir a
+ese ritmo mide el kernel, no el servicio. El verificador acepta una pausa por eso.
+
+A 65 req/s, que es un ritmo de demo honesto: **6000 de 6000, cero perdidas**, con un deploy
+completo y un rollback en el medio.
+
+### El hallazgo que anticipa el contrato (§7.3)
+
+| Modo del verificador | Reparto observado |
+| :--- | :--- |
+| `canal` — un canal compartido, como un cliente gRPC real | **100 % a una sola réplica** |
+| `conexion` — un canal nuevo por request, como N clientes | **50 % / 50 % exacto** |
+
+Un balanceador L4 decide **por conexión**. Una conexión gRPC es persistente y multiplexada:
+el cliente abre un canal y manda todos sus RPC por ahí, así que queda pegado a una réplica
+para siempre. El contrato lo avisa en §7.3 y acá está medido. Para repartir **por RPC** hay
+que subir a L7 y entender HTTP/2 — que es la decisión grande que le queda al equipo
+Plataforma.
 
 ---
 

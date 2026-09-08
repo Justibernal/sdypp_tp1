@@ -40,7 +40,9 @@ public final class Verificador {
             switch (modo) {
                 case "carga" -> carga(canal, destino,
                         Integer.parseInt(args[2]),
-                        args.length > 3 ? Integer.parseInt(args[3]) : 8);
+                        args.length > 3 ? Integer.parseInt(args[3]) : 8,
+                        args.length > 4 && args[4].equals("conexion"),
+                        args.length > 5 ? Integer.parseInt(args[5]) : 0);
                 case "concurrencia" -> concurrencia(canal, destino,
                         Integer.parseInt(args[2]), Integer.parseInt(args[3]));
                 case "secuencia" -> secuencia(canal, destino, Integer.parseInt(args[2]));
@@ -55,7 +57,8 @@ public final class Verificador {
     }
 
     /** N Identidad: cuenta códigos y a qué instancia fue cada una. */
-    private static void carga(ManagedChannel canal, String destino, int n, int hilos) throws Exception {
+    private static void carga(ManagedChannel canal, String destino, int n, int hilos,
+                              boolean canalPorRequest, int pausaMs) throws Exception {
         // ConcurrentHashMap y no HashMap: varios hilos cuentan sobre el mismo mapa y un
         // HashMap se corrompe con escrituras concurrentes. Es la sección crítica del
         // enunciado — la misma que tiene el contador round-robin del balanceador.
@@ -68,8 +71,28 @@ public final class Verificador {
 
         for (int i = 0; i < n; i++) {
             pool.submit(() -> {
+                // Con canalPorRequest cada request abre su propio canal (y por lo tanto su
+                // propia conexion TCP). Es la unica forma de ver el reparto detras de un
+                // balanceador L4, que decide por CONEXION y no por RPC: con el canal unico
+                // las N requests viajan multiplexadas por el mismo socket y caen todas en
+                // la misma replica. No es un truco del verificador: es la diferencia entre
+                // un cliente que reusa el canal y N clientes distintos.
+                // Ritmo: sin pausa el verificador abre conexiones tan rápido que desborda
+                // la cola de accept del sistema operativo (somaxconn) y el balanceador ve
+                // "connection refused" de réplicas que están perfectamente sanas. Un cliente
+                // real no se comporta así — y medir eso mide el kernel, no el servicio.
+                if (pausaMs > 0) {
+                    try {
+                        Thread.sleep(pausaMs);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                ManagedChannel propio = canalPorRequest
+                        ? Grpc.newChannelBuilder(destino, InsecureChannelCredentials.create()).build()
+                        : null;
                 try {
-                    Instancia r = ServicioGrpc.newBlockingStub(canal)
+                    Instancia r = ServicioGrpc.newBlockingStub(propio != null ? propio : canal)
                             .withDeadlineAfter(5, TimeUnit.SECONDS)
                             .identidad(IdentidadPedido.getDefaultInstance());
                     contar(porCodigo, "OK");
@@ -78,6 +101,9 @@ public final class Verificador {
                     contar(porCodigo, e.getStatus().getCode().name());
                     contar(porInstancia, "(sin respuesta)");
                 } finally {
+                    if (propio != null) {
+                        propio.shutdownNow();
+                    }
                     listos.countDown();
                 }
             });
@@ -88,8 +114,9 @@ public final class Verificador {
 
         int ok = porCodigo.getOrDefault("OK", new AtomicInteger()).get();
         System.out.println("=== Verificador · carga · " + destino + " ===");
-        System.out.printf("requests=%d  hilos=%d  tiempo=%dms  ok=%d  fallidas=%d%n",
-                n, hilos, ms, ok, n - ok);
+        System.out.printf("requests=%d  hilos=%d  modo=%s  pausa=%dms  tiempo=%dms  ok=%d  fallidas=%d%n",
+                n, hilos, canalPorRequest ? "un canal por request" : "canal compartido", pausaMs, ms, ok, n - ok);
+        System.out.printf("ritmo=%.0f req/s%n", 1000.0 * n / Math.max(ms, 1));
         System.out.println("\n-- códigos --");
         porCodigo.forEach((k, v) -> System.out.printf("  %-20s %5d  (%.1f%%)%n", k, v.get(), 100.0 * v.get() / n));
         System.out.println("\n-- reparto por instancia --");
