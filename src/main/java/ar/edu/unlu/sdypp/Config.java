@@ -20,11 +20,11 @@ public final class Config {
     /**
      * Un Integrante por persona: el legajo es un campo propio y no un dato embutido
      * en el string del nombre, que obligaría al cliente a parsear por paréntesis.
-     * TODO: faltan los legajos de Agustina y Federico. El campo es int32, así que un
-     * legajo ausente llega como 0 — no se puede distinguir de "no lo mandaron".
+     * TODO: falta el legajo de Federico. El campo es int32, así que un legajo ausente
+     * llega como 0 — no se puede distinguir de "no lo mandaron".
      */
     public static final String[][] EQUIPO = {
-            {"María Agustina", "Ortiz", "0"},
+            {"María Agustina", "Ortiz", "199523"},
             {"Justino", "Bernal", "190118"},
             {"Federico Nicolás", "Kasparian", "0"},
     };

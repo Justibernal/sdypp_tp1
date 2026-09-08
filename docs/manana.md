@@ -412,3 +412,59 @@ ssh -p <PUERTO> <USUARIO>@<HOST>
 | `v carga $URL <N> <hilos> conexion <pausaMs>` | N peticiones; códigos y reparto |
 | `v secuencia $URL <legajo>` | Un alta y la lectura siguiente |
 | `v concurrencia $URL <legajo> <N>` | N altas del mismo legajo a la vez |
+
+---
+
+# Anexo 4 · Si corrés en Windows (Git Bash)
+
+Todo el proyecto anda igual, pero hay cuatro diferencias. Las tres primeras ya están
+resueltas en el código; la cuarta la tenés que poner vos.
+
+**1 · Se usa Git Bash, no PowerShell.** Los scripts son `bash`. Abrí *Git Bash* y usá `sh
+deploy/deploy.sh ...` en vez de `./deploy/deploy.sh ...`. La ruta del proyecto se escribe
+`/c/Users/<usuario>/sdypp_servJava`.
+
+**2 · El proyecto va en `C:\Users\<usuario>\sdypp_servJava`.** Fuera de la carpeta de la
+materia: esa ruta tiene espacios y un emoji, y `java -jar` falla desde ahí.
+
+**3 · Docker Desktop tiene que estar abierto** antes de cualquier cosa. No hay `open -a
+Docker`: se abre desde el menú Inicio. Chequeo: `docker info > /dev/null 2>&1 && echo OK`.
+
+**4 · `CASA` hay que pasarla siempre.** El `deploy.sh` tiene `casa-justino` como valor por
+defecto. Si no la pasás, tu bitácora dice que atendió la casa de otro — y la auditoría de la
+Etapa 2 es justamente demostrar qué casa atendió qué. En cada terminal, antes de todo:
+
+```bash
+export CASA=casa-agustina
+```
+
+Con eso, `deploy.sh` y el conmutador la toman solos y no hay que repetirla en cada comando.
+
+### Arranque completo en Windows
+
+```bash
+cd /c/Users/Usuario/sdypp_servJava
+export CASA=casa-agustina
+
+sh deploy/deploy.sh desplegar
+source deploy/entorno.sh
+
+# Segunda pestaña: el balanceador del Plan B
+cd /c/Users/Usuario/sdypp_servJava && export CASA=casa-agustina
+source deploy/entorno.sh
+java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.Conmutador 8080 9090 localhost:$P1,localhost:$P2
+```
+
+Para que el `deploy.sh` conmute el balanceador de verdad (momentos E y F), la primera pestaña
+necesita además:
+
+```bash
+export CONMUTADOR_ADMIN=http://localhost:9090/backends
+```
+
+### Dos detalles que muerden
+
+| Síntoma | Por qué |
+| :--- | :--- |
+| `tail -2 logs/blue/*.log` da `option used in invalid context` | El `tail` de Git Bash no acepta `-2` con varios archivos. Usá `tail -n 2 <archivo>`, de a uno |
+| Los acentos salen como `c�digos` | La consola de Windows no es UTF-8. Los atajos `c` y `v` de `entorno.sh` ya pasan `-Dstdout.encoding=UTF-8`; si llamás a `java` a mano, agregalo |

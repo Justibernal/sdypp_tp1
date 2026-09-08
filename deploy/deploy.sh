@@ -94,7 +94,13 @@ levantar_color() {  # <color> <tag>
     nombre="$(contenedor "$color" "$n")"
     puerto="$(puerto_de "$color" "$n")"
     docker rm -f "$nombre" >/dev/null 2>&1 || true
-    docker run -d --name "$nombre" --network "$RED" -p "$puerto:8080" \
+    # MSYS_NO_PATHCONV=1: en Git Bash sobre Windows, MSYS reescribe los argumentos que
+    # parecen rutas Unix antes de pasárselos a docker.exe, y convierte el destino del
+    # volumen (/app/logs) en una ruta de Windows. El contenedor arranca igual, pero el
+    # montaje apunta a otro lado y la bitácora nunca llega al disco de la casa — y sin
+    # bitácora no hay auditoría, que es el ejercicio central de la Etapa 2.
+    # En macOS y Linux la variable no existe y se ignora: no cambia nada.
+    MSYS_NO_PATHCONV=1 docker run -d --name "$nombre" --network "$RED" -p "$puerto:8080" \
       -e HOST_NAME="$CASA-$color-$n" -e CASA="$CASA" -e TP_REDIS_URL="$TP_REDIS_URL" \
       -v "$PWD/logs/$color:/app/logs" --stop-timeout 15 "$IMAGEN:$tag" >/dev/null
     log "arriba $nombre en :$puerto"

@@ -23,8 +23,12 @@ export URL="${URL:-localhost:8080}"
 export CONMUTADOR_ADMIN="${CONMUTADOR_ADMIN:-http://localhost:9090/backends}"
 
 # Atajos. Son funciones y no alias para que anden también dentro de scripts.
-c() { java -cp "$_raiz/target/app-java.jar" ar.edu.unlu.sdypp.Cliente "$@"; }
-v() { java -cp "$_raiz/target/app-java.jar" ar.edu.unlu.sdypp.Verificador "$@"; }
+#
+# -Dstdout.encoding=UTF-8: en Windows la consola usa la codificación del sistema
+# (cp1252) y los acentos y los ✅ del verificador salen como "?" o "�" — justo en la
+# demo, proyectado. En macOS y Linux la consola ya es UTF-8 y la opción no cambia nada.
+c() { java -Dstdout.encoding=UTF-8 -cp "$_raiz/target/app-java.jar" ar.edu.unlu.sdypp.Cliente "$@"; }
+v() { java -Dstdout.encoding=UTF-8 -cp "$_raiz/target/app-java.jar" ar.edu.unlu.sdypp.Verificador "$@"; }
 
 echo "  color activo : $COLOR"
 echo "  réplicas     : $REPLICA_1 (:$P1) · $REPLICA_2 (:$P2)"
