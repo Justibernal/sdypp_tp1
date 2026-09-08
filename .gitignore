@@ -5,3 +5,4 @@ logs/
 *.iml
 .DS_Store
 dependency-reduced-pom.xml
+deploy/.estado
