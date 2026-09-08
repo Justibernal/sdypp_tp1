@@ -1,296 +1,379 @@
-# Mañana en clase — de cero, comando por comando
+# Arranque y demo — paso a paso
 
-Copiá y pegá de arriba hacia abajo. Cada bloque dice qué tenés que ver si salió bien.
+Guía de terminal del equipo Java. Se copia y se pega de arriba hacia abajo. Cada bloque dice
+**qué tenés que ver** si salió bien.
 
-**Todo el arranque tarda ~30 segundos.** Hacelo apenas llegues, no cuando te toque exponer.
+El arranque completo tarda unos **30 segundos**. Hacelo apenas llegues, no cuando te toque
+exponer.
 
 ---
 
-## Paso 0 · Abrir la terminal y entrar al proyecto
+# Parte 0 · Una sola vez, antes del día de la demo
+
+Cada integrante, en su máquina:
+
+```bash
+git clone https://github.com/Justibernal/sdypp_tp1.git ~/sdypp_servJava
+cd ~/sdypp_servJava
+./mvnw -q package
+```
+
+Hace falta tener **Java 17 o superior** y **Docker Desktop** instalados. La primera
+compilación baja las dependencias y puede tardar un par de minutos; las siguientes tardan
+segundos.
+
+> **El proyecto no va dentro de la carpeta de la materia.** Esa ruta tiene un emoji (`📚`) y
+> `java -jar` falla desde ahí. Siempre en `~/sdypp_servJava`.
+
+---
+
+# Parte 1 · Arranque
+
+## Paso 1 · Entrar al proyecto
 
 ```bash
 cd ~/sdypp_servJava
-```
-
-> **Importante:** el proyecto **no** está en la carpeta de la materia. La ruta
-> `📚 Facu/...` tiene un emoji y `java -jar` falla desde ahí. Siempre desde `~/sdypp_servJava`.
-
-Confirmá que estás bien parado:
-
-```bash
 pwd && ls
 ```
 
-Tenés que ver `pom.xml`, `Dockerfile`, `src`, `deploy`, `docs`.
+**Se espera:** la ruta `/Users/<usuario>/sdypp_servJava` y, entre los archivos, `pom.xml`,
+`Dockerfile`, `src`, `deploy`, `docs`.
 
----
-
-## Paso 1 · ¿Docker está andando?
+## Paso 2 · Confirmar que Docker está andando
 
 ```bash
 docker info > /dev/null 2>&1 && echo "Docker OK" || echo "Docker CAIDO"
 ```
 
-Si dice **CAIDO**, abrí Docker Desktop y esperá ~15 s:
+**Se espera:** `Docker OK`.
+
+Si dice `Docker CAIDO`, abrilo y esperá unos quince segundos:
 
 ```bash
 open -a Docker
 ```
 
-Después repetí el chequeo hasta que diga OK. **Nada funciona sin esto.**
+Repetí el chequeo hasta que diga OK. **Nada de lo que sigue funciona sin esto.**
 
----
-
-## Paso 2 · Compilar
+## Paso 3 · Compilar
 
 ```bash
 ./mvnw -q package
-```
-
-Tarda **~4 segundos** (la primera vez del día puede tardar más). No tiene que imprimir nada.
-Confirmá que salió el jar:
-
-```bash
 ls -lh target/app-java.jar
 ```
 
-Se espera: **≈ 22 MB**.
+**Se espera:** el comando no imprime nada, y el jar pesa **≈ 22 MB**.
 
----
-
-## Paso 3 · Levantar todo: la base y las dos réplicas
+## Paso 4 · Levantar la base y las réplicas
 
 ```bash
 ./deploy/deploy.sh desplegar
 ```
 
-Tarda **~15 segundos**. Tenés que ver:
+Tarda unos **15 segundos**. **Se espera**, al final:
 
 ```
-[  ok  ] sdypp-java-blue-1 sano y sirviendo v7
-[  ok  ] sdypp-java-blue-2 sano y sirviendo v7
-[  ok  ] sirviendo blue (v7)
+[  ok  ] sdypp-java-<color>-1 sano y sirviendo v7
+[  ok  ] sdypp-java-<color>-2 sano y sirviendo v7
+[  ok  ] sirviendo <color> (v7)
 
-  color activo: blue
-  sdypp-java-blue-1   running   healthy   8111
-  sdypp-java-blue-2   running   healthy   8112
+  color activo: <color>
+  sdypp-java-<color>-1   running   healthy   81x1
+  sdypp-java-<color>-2   running   healthy   81x2
 ```
 
-Ese comando levantó Redis, construyó la imagen y arrancó **dos réplicas** — no hace falta
-nada más.
+Ese único comando levantó Redis, construyó la imagen y arrancó **dos réplicas**.
 
----
+> **Sobre el color:** el sistema alterna entre `blue` y `green` en cada deploy — así es como
+> se despliega sin cortar el servicio. **No hace falta acordarse de cuál está activo:** el
+> paso siguiente lo averigua solo.
 
-## Paso 4 · Levantar el balanceador
+## Paso 5 · Cargar el entorno de trabajo
 
-**Sólo si vamos con el Plan B** (nuestro conmutador). Si el balanceador lo pone Plataforma,
-saltá al Paso 5 y usá la URL que te den.
+```bash
+source deploy/entorno.sh
+```
 
-Abrí una **segunda pestaña de terminal** y dejá esto corriendo a la vista:
+**Se espera:**
+
+```
+  color activo : green
+  réplicas     : sdypp-java-green-1 (:8121) · sdypp-java-green-2 (:8122)
+  bitácoras    : /Users/.../logs/green
+  URL pública  : localhost:8080
+  atajos       : c <destino> <cmd>   ·   v <modo> <destino> ...
+```
+
+Esto deja listas las variables `$COLOR`, `$REPLICA_1`, `$REPLICA_2`, `$P1`, `$P2`, `$LOGS` y
+`$URL`, más dos atajos: **`c`** (cliente) y **`v`** (verificador). De acá en adelante la guía
+los usa.
+
+> **Hay que repetirlo en cada pestaña nueva de la terminal**, y también después de cada
+> deploy, porque el color cambia.
+
+## Paso 6 · Levantar el balanceador
+
+**Sólo con el Plan B**, es decir, si el balanceador no lo pone el equipo Plataforma. Si lo
+ponen ellos, saltá al Paso 7 y usá la URL que te den:
+
+```bash
+export URL=<la-url-que-den>
+export CONMUTADOR_ADMIN=<el-endpoint-que-den>
+```
+
+Para el Plan B, abrí una **segunda pestaña** y dejá esto corriendo a la vista:
 
 ```bash
 cd ~/sdypp_servJava
+source deploy/entorno.sh
 CASA=casa-justino TP_LOGS=logs/conmutador \
   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.Conmutador \
-       8080 9090 localhost:8111,localhost:8112
+       8080 9090 localhost:$P1,localhost:$P2
 ```
 
-Tenés que ver:
+**Se espera:**
 
 ```
 Conmutador (PLAN B) escuchando en 0.0.0.0:8080 · admin en :9090
-[conmutador] backends: localhost:8111(sano), localhost:8112(sano)
+[conmutador] backends: localhost:8121(sano), localhost:8122(sano)
 ```
 
-Los dos tienen que decir **(sano)**. Si dicen `(caido)`, volvé al Paso 3.
+Los dos backends tienen que decir **`(sano)`**. Si alguno dice `(caido)`, volvé al Paso 4.
 
----
-
-## Paso 5 · Probar que todo responde
+## Paso 7 · Probar que todo responde
 
 Volvé a la primera pestaña.
 
 ```bash
-cd ~/sdypp_servJava
-alias c='java -cp target/app-java.jar ar.edu.unlu.sdypp.Cliente'
-alias v='java -cp target/app-java.jar ar.edu.unlu.sdypp.Verificador'
+c $URL identidad
+c $URL alta "Ada Lovelace" 100200
+c $URL personas
 ```
 
-> Ese `alias` vale sólo en esa pestaña. Si abrís otra, repetilo.
+**Se espera:** `app: "java"`; después la persona creada con su `id`; después la lista
+conteniéndola.
+
+Si esto anda, **el sistema está listo**.
+
+> Los nombres con acento se ven escapados (`Mar\303\255a`). Es normal: así imprime el formato
+> de texto de Protobuf. En el mensaje que viaja por la red el acento va bien.
+
+## Paso 8 · Dejar la bitácora proyectada
+
+Tercera pestaña, y no se toca más:
 
 ```bash
-c localhost:8080 identidad
-c localhost:8080 alta "Ada Lovelace" 100200
-c localhost:8080 personas
-```
-
-Se espera: `app: "java"`, después la persona creada con `id: 1`, después la lista con esa
-persona. **Si esto anda, estás listo.**
-
----
-
-## Paso 6 · Dejar la bitácora proyectada
-
-Tercera pestaña, y no la toques más:
-
-```bash
-cd ~/sdypp_servJava && docker logs -f sdypp-java-blue-1
+cd ~/sdypp_servJava && source deploy/entorno.sh && docker logs -f $REPLICA_1
 ```
 
 Ahí se ve, en vivo, cada operación que atiende esa réplica.
 
 ---
 
-# La demo
+# Parte 2 · La demo
 
-## A · El reparto
+Siete momentos. Los A, B y C los corre **el equipo verificador desde otra máquina**; los
+demás, nosotros.
+
+## A · El reparto entre réplicas
 
 ```bash
-v carga localhost:8080 200 4 conexion 20
+v carga $URL 200 4 conexion 20
 ```
 
-Se espera: **200 OK, 0 fallidas**, y el reparto ~50/50 entre las dos réplicas.
+**Se espera:** `200 OK, 0 fallidas`, y el reparto repartido entre las réplicas.
 
-> **Si el reparto da 100 % a una sola**, no es un error: es que el balanceador reparte por
-> conexión. Sacá el `conexion` del final para mostrar el caso contrario y explicá el hallazgo.
+> **Si da 100 % a una sola réplica, no es un error.** Significa que el balanceador reparte
+> por conexión. Para mostrar el contraste, corré el mismo comando **sin** la palabra
+> `conexion`: ahí el cliente reusa un solo canal y todo cae en una réplica. Es un hallazgo
+> del trabajo, está explicado en `docs/diagramas.md`, diagrama 7.
 
 ## B · El estado compartido
 
 ```bash
-v secuencia localhost:8080 700100
+v secuencia $URL 700100
 ```
 
-Se espera: el alta la atiende una réplica y la lectura **la otra**, y el dato está. Eso
-prueba que el estado vive en Redis y no en las instancias.
+**Se espera:** el alta la atiende una réplica y la lectura **la otra**, y el dato aparece
+igual. Eso prueba que el estado vive en la base y no en las instancias.
 
-## C · La auditoría
+**Anotá el `id` que devuelve**, hace falta para el momento C.
 
-Tomá el `id` que devolvió el paso B y buscalo en los dos logs:
+## C · La auditoría cruzada
+
+Con el `id` del paso B:
 
 ```bash
-grep "id=7" logs/blue/bitacora-*.log
-grep "CONEXION" logs/conmutador/bitacora-conmutador.log | tail -5
+grep "id=<ID>" $LOGS/bitacora-*.log
+tail -5 logs/conmutador/bitacora-conmutador.log
 ```
 
-El primero dice **qué hizo** la réplica; el segundo, **a quién derivó** el balanceador.
+**Se espera:** el primero muestra **qué hizo** la réplica; el segundo, **a quién derivó** el
+balanceador. Dos archivos, dos piezas, una sola operación reconstruida.
 
 ## D · Matar una réplica
 
 ```bash
-docker stop sdypp-java-blue-2
+docker stop $REPLICA_2
 sleep 10
-v carga localhost:8080 100 4 conexion 20
+v carga $URL 100 4 conexion 20
+c $URL personas
 ```
 
-Se espera: **100 OK**, todo a la réplica que queda. Y los datos siguen:
+**Se espera:** `100 OK, 0 fallidas`, todo dirigido a la réplica que queda, y las personas
+guardadas siguen estando.
+
+Volvé a levantarla:
 
 ```bash
-c localhost:8080 personas
-```
-
-Levantala de nuevo:
-
-```bash
-docker start sdypp-java-blue-2
+docker start $REPLICA_2
 ```
 
 ## E · Deploy sin downtime
 
-Primera pestaña — arrancá el loop **en segundo plano**:
+Arrancá el loop **en segundo plano**:
 
 ```bash
-v carga localhost:8080 3000 4 conexion 50 > /tmp/loop.txt 2>&1 &
+v carga $URL 3000 4 conexion 50 > /tmp/loop.txt 2>&1 &
 ```
 
-Ahora subí la versión y deployá **mientras el loop corre**:
+Ahora, **mientras el loop corre**, subí la versión y deployá:
 
 ```bash
-sed -i '' 's/VERSION = 7/VERSION = 8/' src/main/java/ar/edu/unlu/sdypp/Config.java
-CONMUTADOR_ADMIN=http://localhost:9090/backends ./deploy/deploy.sh desplegar
+./deploy/version.sh 8
+./deploy/deploy.sh desplegar
 ```
 
-Cuando el loop termine:
+Cuando el deploy termine, esperá a que cierre el loop y mirá el resultado:
 
 ```bash
-cat /tmp/loop.txt
+wait; cat /tmp/loop.txt
 ```
 
-Se espera: **0 fallidas**, y en el reparto se ven **las dos versiones** — v7 antes de
-conmutar, v8 después.
+**Se espera:** `0 fallidas`, y en el reparto aparecen **las dos versiones** — v7 antes de
+conmutar y v8 después. El servicio nunca dejó de responder.
+
+Recargá el entorno, porque el color cambió:
+
+```bash
+source deploy/entorno.sh
+```
 
 ## F · El deploy que se aborta solo
 
-Rompé la app a propósito:
+Se rompe la app a propósito y se intenta deployar:
 
 ```bash
-sed -i '' 's|int puerto = Config.puerto(args);|if (true) throw new IllegalStateException("rota"); int puerto = Config.puerto(args);|' src/main/java/ar/edu/unlu/sdypp/AppJava.java
-sed -i '' 's/VERSION = 8/VERSION = 9/' src/main/java/ar/edu/unlu/sdypp/Config.java
-CONMUTADOR_ADMIN=http://localhost:9090/backends ./deploy/deploy.sh desplegar
-echo "codigo de salida: $?"
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("src/main/java/ar/edu/unlu/sdypp/AppJava.java")
+s = p.read_text()
+p.write_text(s.replace("int puerto = Config.puerto(args);",
+    'if (true) throw new IllegalStateException("version rota");\n        int puerto = Config.puerto(args);'))
+print("app rota a proposito")
+PY
+./deploy/version.sh 9
+./deploy/deploy.sh desplegar; echo "codigo de salida: $?"
 ```
 
-Se espera: tarda ~60 s esperando el health, y después
+Tarda alrededor de un minuto esperando el health check. **Se espera:**
 
 ```
 [ERROR ] ABORTA: se bajan todas las réplicas ... y NO se conmuta
+[ERROR ] las ... nunca dejaron de servir; el usuario no vio la versión rota
 codigo de salida: 1
 ```
 
-Y el servicio **sigue respondiendo la versión buena**:
+Y el servicio sigue respondiendo la versión buena:
 
 ```bash
-c localhost:8080 identidad | grep version
+c $URL identidad | grep version
 ```
 
-**Dejá la app como estaba:**
+**Dejá el código como estaba:**
 
 ```bash
 git checkout src/main/java/ar/edu/unlu/sdypp/AppJava.java
-sed -i '' 's/VERSION = 9/VERSION = 8/' src/main/java/ar/edu/unlu/sdypp/Config.java
+./deploy/version.sh 8
 ```
 
-## G · Rollback
+## G · El rollback
 
 ```bash
-CONMUTADOR_ADMIN=http://localhost:9090/backends ./deploy/deploy.sh rollback
-c localhost:8080 identidad | grep version
+./deploy/deploy.sh rollback
+source deploy/entorno.sh
+c $URL identidad | grep -E "version|mensaje"
 ```
 
-Se espera: vuelve a la versión anterior, que seguía viva al lado. **Un comando.**
+**Se espera:** vuelve a la versión anterior, que seguía viva al lado. **Un comando.**
 
 ---
 
-## Bajar todo al terminar
+# Parte 3 · Bajar todo al terminar
 
 ```bash
 pkill -f planb.Conmutador
 ./deploy/deploy.sh bajar
 ```
 
----
-
-## ¿Y "entrar al server"?
-
-**Para nuestra parte, no hace falta entrar a ningún server.** Nuestras réplicas corren en
-nuestras máquinas, en contenedores. En la Clase 1 se entraba por SSH al server de Plataforma
-porque el deploy era manual; ahora el deploy es un script y la app viaja como imagen.
-
-Si igual necesitás entrar al de ellos, en la Clase 1 era así — **pero esos datos son del
-01/09 y seguro cambiaron, hay que pedirlos de nuevo**:
-
-```bash
-ssh -p <PUERTO-QUE-DEN> alumno@<HOST-QUE-DEN>
-```
+**Se espera:** `[  ok  ] todo abajo`.
 
 ---
 
-## Si algo falla
+# Anexo 1 · Si algo falla
 
 | Síntoma | Qué correr |
 | :--- | :--- |
 | Nada arranca | `docker info` — si falla, `open -a Docker` |
-| `UNAVAILABLE` en personas | `docker ps \| grep redis` — ¿está la base? |
-| Una réplica no llega a `healthy` | `docker logs sdypp-java-blue-1 \| tail -30` |
-| El conmutador dice `(caido)` | `docker inspect --format '{{.State.Health.Status}}' sdypp-java-blue-1` |
-| `command not found: c` | Repetí los `alias` del Paso 5 en esa pestaña |
-| Todo raro | `./deploy/deploy.sh bajar` y volvé al Paso 3 |
+| `command not found: c` | `source deploy/entorno.sh` en esa pestaña |
+| Los comandos usan el color equivocado | `source deploy/entorno.sh` — el color cambia en cada deploy |
+| `UNAVAILABLE` al pedir personas | `docker ps \| grep redis` — ¿está la base levantada? |
+| Una réplica no llega a `healthy` | `docker logs $REPLICA_1 \| tail -30` |
+| El conmutador dice `(caido)` | `docker inspect --format '{{.State.Health.Status}}' $REPLICA_1` |
+| El reparto no se ve | Agregá `conexion` al final del comando `v carga` |
+| `docker stop` tarda unos segundos | Es normal: es el drenado de las peticiones en curso |
+| Todo raro | `./deploy/deploy.sh bajar` y volvé al Paso 4 |
+
+Diagnóstico general:
+
+```bash
+./deploy/deploy.sh estado
+c localhost:$P1 salud
+curl -s localhost:9090/estado      # sólo con el conmutador del Plan B
+```
+
+---
+
+# Anexo 2 · Sobre "entrar al server"
+
+**Para nuestra parte no hace falta entrar a ningún servidor.** Las réplicas corren en las
+máquinas del equipo, dentro de contenedores. En la Clase 1 se entraba por SSH al servidor de
+Plataforma porque el deploy era manual; ahora el deploy es un script y la aplicación viaja
+como imagen de Docker.
+
+Si hiciera falta entrar al de Plataforma, hay que pedirles la dirección y el puerto del día
+— los de la Clase 1 ya no sirven:
+
+```bash
+ssh -p <PUERTO> <USUARIO>@<HOST>
+```
+
+---
+
+# Anexo 3 · Referencia rápida de comandos
+
+| Comando | Qué hace |
+| :--- | :--- |
+| `source deploy/entorno.sh` | Carga variables y atajos. **Tras cada deploy y en cada pestaña** |
+| `./deploy/deploy.sh desplegar` | Construye, levanta al lado, verifica y conmuta |
+| `./deploy/deploy.sh rollback` | Vuelve a la versión anterior |
+| `./deploy/deploy.sh estado` | Qué color sirve y cómo está cada réplica |
+| `./deploy/deploy.sh bajar` | Baja todo |
+| `./deploy/version.sh [n]` | Muestra o fija la versión declarada |
+| `c $URL identidad` | Quién atendió y qué versión sirve |
+| `c $URL alta "<nombre>" <legajo>` | Da de alta una persona |
+| `c $URL personas` | Lista lo guardado |
+| `c $URL salud` / `c $URL health` | El RPC del contrato / el health estándar |
+| `v carga $URL <N> <hilos> conexion <pausaMs>` | N peticiones; códigos y reparto |
+| `v secuencia $URL <legajo>` | Un alta y la lectura siguiente |
+| `v concurrencia $URL <legajo> <N>` | N altas del mismo legajo a la vez |

@@ -1,11 +1,13 @@
-# Guía de la demo — equipo Java
+# Plan de la demo — equipo Java
 
-Qué hace cada uno, en qué orden, y qué comando corre. Pensada para tener abierta durante la
-clase.
+Qué tiene que pasar el día de la entrega, qué necesitamos del equipo Plataforma y qué hace
+cada integrante.
+
+Los comandos concretos no están acá: están en **[`manana.md`](manana.md)**.
 
 ---
 
-## Cómo funciona, en cuatro pasos
+## Cómo funciona el sistema, en cuatro pasos
 
 ```
 cliente  ──►  BALANCEADOR  ──►  RÉPLICA  ──►  REDIS  ──►  respuesta
@@ -14,254 +16,178 @@ cliente  ──►  BALANCEADOR  ──►  RÉPLICA  ──►  REDIS  ──�
 ```
 
 1. El cliente le habla a **una sola URL**. No sabe ni le importa cuántas réplicas hay.
-2. El **balanceador** elige una réplica **sana** (round-robin) y le reenvía la request.
+2. El **balanceador** elige una réplica **sana** y le reenvía la petición.
 3. La **réplica** atiende el RPC. Si toca personas, lee o escribe en **Redis**.
 4. Cada pieza deja **una línea de log**: el balanceador anota a quién derivó, la réplica
-   anota qué hizo. Cruzándolas se reconstruye una operación puntual.
+   anota qué hizo. Cruzando los dos archivos se reconstruye una operación puntual.
 
 Las réplicas son *stateless*: no guardan nada propio. Por eso una puede atender el alta y
 otra la lectura siguiente, y por eso matar una no pierde datos.
 
----
-
-## Antes de la clase — cada uno en su casa
-
-```bash
-docker info                       # 1. Docker andando
-cd ~/sdypp_servJava
-./mvnw -q package                 # 2. compila (la primera vez baja dependencias)
-docker build -t sdypp-app-java:local .
-tailscale status                  # 3. si el balanceador es remoto
-```
-
-**Verificación cruzada entre nosotros:** que otro del equipo corra
-`java -cp target/app-java.jar ar.edu.unlu.sdypp.Cliente TU-HOST:8121 identidad` y le
-responda. Si eso anda, estás en el pool.
+Los diagramas de todo esto están en **[`diagramas.md`](diagramas.md)**.
 
 ---
 
 ## Lo que hay que pedirle al equipo Plataforma
 
-Sin estos tres datos no nos podemos enchufar. **Pedirlos apenas empiece la clase, no en el
-medio de la demo.**
+Sin estos tres datos no nos podemos enchufar a su balanceador. **Conviene pedirlos apenas
+empiece la clase, no en el medio de la demo.**
 
 | # | Qué | Para qué |
 | :--- | :--- | :--- |
 | 1 | **URL pública del balanceador** (`host:puerto`) | Es contra lo que corre el verificador |
 | 2 | **Cómo se le agregan backends** — la firma exacta del pedido | El `deploy.sh` la necesita para conmutar |
-| 3 | **`TP_REDIS_URL`** de la base compartida | Sin eso los RPC de personas dan `UNAVAILABLE` |
+| 3 | **`TP_REDIS_URL`** de la base compartida | Sin eso los RPC de personas responden `UNAVAILABLE` |
 
-Y hay que **avisarles tres cosas** sobre nuestras réplicas:
+## Lo que hay que avisarles
 
-- Hablan **gRPC sobre HTTP/2**. Un proxy que parsea HTTP/1.1 **no funciona**: o reenvían
-  bytes (L4) o hablan HTTP/2 de verdad (L7).
+Tres cosas sobre nuestras réplicas. Son las que más probablemente fallen:
+
+- Hablan **gRPC sobre HTTP/2**. Un proxy que parsea HTTP/1.1 **no funciona**: o reenvía bytes
+  (nivel 4) o habla HTTP/2 de verdad (nivel 7).
 - El health check es **`grpc.health.v1.Health`**, no un `GET /health`.
-- Si reparten **por conexión**, un cliente gRPC queda pegado a una réplica y el reparto no
-  se ve en la demo. Está medido: 100 % a una sola réplica con canal compartido.
+- Si reparten **por conexión**, un cliente gRPC queda pegado a una réplica y el reparto no se
+  ve. Está medido: 100 % a una sola réplica con canal compartido.
 
 ---
 
-## El problema real: que su balanceador NOS ALCANCE
+## El problema a resolver: que su balanceador nos alcance
 
-Nuestras réplicas corren en la Mac de casa, en `localhost:8121` y `localhost:8122`. Desde
-otra casa **eso no se alcanza**. Hay que resolverlo, y hay tres caminos, de mejor a peor:
+Nuestras réplicas corren en la máquina de cada uno, en puertos locales. **Desde otra casa eso
+no se alcanza.** Hay tres caminos, de mejor a peor:
 
-### Opción A — Tailscale (la que pide el enunciado)
+### Opción A · Tailscale — es lo que pide el enunciado
 
-Las dos máquinas entran al mismo tailnet y su balanceador nos alcanza por nombre, sin abrir
+Las máquinas entran al mismo tailnet y el balanceador nos alcanza por nombre, sin abrir
 puertos al mundo.
 
 ```bash
-tailscale status                    # confirmar que estamos en el tailnet del grupo
-tailscale ip -4                     # la IP que hay que darle
-sudo ufw allow in on tailscale0 to any port 8121 proto tcp   # sólo en Linux
+tailscale status      # confirmar que estamos en el tailnet del grupo
+tailscale ip -4       # la dirección que hay que darles
 ```
 
-Le pasamos `casa-justino:8121` y `casa-justino:8122`.
+En Linux hay que abrir los puertos sólo hacia el tailnet:
 
-### Opción B — túnel TCP
+```bash
+sudo ufw allow in on tailscale0 to any port 8111 proto tcp
+sudo ufw allow in on tailscale0 to any port 8112 proto tcp
+sudo ufw allow in on tailscale0 to any port 8121 proto tcp
+sudo ufw allow in on tailscale0 to any port 8122 proto tcp
+```
 
-Si Tailscale no sale. **Tiene que ser túnel TCP, no HTTP**: el túnel HTTP del plan free de
-ngrok no sirve para gRPC sin TLS end-to-end.
+### Opción B · Túnel TCP
+
+Si Tailscale no sale. **Tiene que ser túnel TCP, no HTTP**: el túnel HTTP del plan gratuito
+de ngrok no sirve para gRPC sin TLS de punta a punta.
 
 ```bash
 ngrok tcp 8121
 ```
 
-**Limitación:** el plan free da **un solo túnel a la vez**, y nosotros tenemos dos réplicas.
-O se paga, o se expone una sola —y ahí perdemos parte del reparto.
+**Limitación:** el plan gratuito da **un solo túnel a la vez** y nosotros tenemos dos
+réplicas. O se paga, o se expone una sola y se pierde parte del reparto.
 
-### Opción C — le pasamos la imagen y las corre él
+### Opción C · Les pasamos la imagen y la corren ellos
 
-La más confiable si la red no sale. Nuestra app es una imagen Docker: se la mandamos y él
-levanta dos réplicas Java al lado de las Python.
+La más confiable si la red no sale. Nuestra aplicación es una imagen de Docker:
 
 ```bash
-docker save sdypp-app-java:local | gzip > app-java.tar.gz     # ~90 MB comprimido
-# él, del otro lado:
+docker save sdypp-app-java:local | gzip > app-java.tar.gz    # ~90 MB
+```
+
+Del otro lado:
+
+```bash
 gunzip -c app-java.tar.gz | docker load
 docker run -d --name java-1 -p 8121:8080 \
   -e HOST_NAME=java-1 -e CASA=casa-plataforma \
   -e TP_REDIS_URL=<la-url-de-la-base> sdypp-app-java:local
 ```
 
-**Lo que se pierde y hay que decirlo:** las réplicas ya no están en nuestra casa, así que no
-se prueba la red entre casas ni la latencia real. Pero el pool **sí** queda mixto Java+Python
-detrás de un solo balanceador, que es el punto de la Etapa 2.
+**Lo que se pierde y hay que decirlo en voz alta:** las réplicas ya no están en nuestra casa,
+así que no se prueba la red entre casas ni la latencia real. Pero el pool **sí** queda mixto
+Java + Python detrás de un solo balanceador, que es el punto de la Etapa 2.
 
 ---
 
-## Árbol de decisión para mañana
+## Árbol de decisión
 
 ```
-¿Tomás tiene el balanceador andando?
+¿El equipo Plataforma tiene el balanceador andando?
+│
 ├── SÍ ──► ¿nos alcanza desde su máquina?
-│          ├── SÍ (Tailscale o túnel) ──► DEMO COMPLETA. Nuestro conmutador queda apagado.
-│          └── NO ──► Opción C: le pasamos la imagen, corre él las réplicas Java.
-└── NO ───► PLAN B: nuestro conmutador. Se dice en voz alta qué se pierde.
+│          ├── SÍ (Tailscale o túnel) ──► demo completa; nuestro conmutador queda apagado
+│          └── NO ──────────────────────► Opción C: corren ellos las réplicas Java
+│
+└── NO ───► PLAN B: nuestro propio conmutador
 ```
 
-En los tres casos **nuestro código es el mismo**. Lo único que cambia:
+**En los tres casos nuestro código es exactamente el mismo.** Lo único que cambia son dos
+variables de entorno:
 
 ```bash
-URL=<la-que-den>                        # en vez de localhost:8080
-CONMUTADOR_ADMIN=<su-endpoint>          # en vez de http://localhost:9090/backends
+export URL=<la-url-del-balanceador>          # por defecto: localhost:8080
+export CONMUTADOR_ADMIN=<su-endpoint>        # por defecto: http://localhost:9090/backends
 ```
+
+El `deploy.sh` tiene la conmutación aislada en una única función justo para esto.
 
 ---
 
-## Lo que les damos a ellos
+## Sobre el Plan B
 
-```
-casa-justino   →  <host-tailscale>:8121   (Java v7)
-casa-justino   →  <host-tailscale>:8122   (Java v7)
-```
+Es el plan B que el enunciado permite declarar, y **hay que declararlo, no disimularlo**. Lo
+que se pierde:
 
-Levantar las réplicas apuntando a la Redis del grupo:
+- Las "casas" pasan a ser contenedores en una sola máquina: no se prueba la red entre casas
+  ni la latencia real entre ellas.
+- El pool queda sólo con réplicas Java, sin mezclar con Python.
+- El balanceador es el nuestro, no el del equipo Plataforma.
 
-```bash
-TP_REDIS_URL='redis://:PASS@casa-nomico:6379/0' ./deploy/deploy.sh desplegar
-./deploy/deploy.sh estado          # confirmar que las dos quedaron healthy
-```
-
----
-
-## Guion de la demo
-
-### Momento 0 — dejar esto proyectado
-
-```bash
-docker logs -f sdypp-java-green-1          # la bitácora en vivo
-```
-
-### Momento 1 — el reparto (Etapa 2)
-
-Lo corre **el equipo verificador, desde otra casa**:
-
-```bash
-java -cp app-java.jar ar.edu.unlu.sdypp.Verificador carga <URL-BALANCEADOR> 200 8 conexion 20
-```
-
-Se espera: 200 OK, y el reparto alternando entre réplicas Java y Python.
-
-### Momento 2 — el estado compartido
-
-```bash
-java -cp app-java.jar ar.edu.unlu.sdypp.Verificador secuencia <URL-BALANCEADOR> 700100
-```
-
-El alta la atiende una app y la lectura la otra — y el dato está. Ahí se ve el
-`servidoPor` distinto en las dos respuestas.
-
-### Momento 3 — la auditoría
-
-Se elige **un alta concreta** del verificador y se la rastrea en dos archivos:
-
-```bash
-grep "id=7" logs/green/bitacora-*.log        # qué hizo la réplica
-grep "22:03:2"  logs/conmutador/bitacora-*.log   # a quién derivó el balanceador
-```
-
-Dos archivos, dos máquinas, una historia.
-
-### Momento 4 — matar una réplica
-
-```bash
-docker stop sdypp-java-green-2
-```
-
-El loop sigue, la réplica sale de rotación a los 3 chequeos fallidos (≈9 s), y **las personas
-guardadas siguen estando**.
-
-### Momento 5 — el deploy sin downtime (Etapa 1)
-
-Con el loop del verificador corriendo:
-
-```bash
-# subir Config.VERSION y después:
-CONMUTADOR_ADMIN=<endpoint-de-plataforma> ./deploy/deploy.sh desplegar
-```
-
-Se ve la versión cambiar en las respuestas, sin requests perdidas.
-
-### Momento 6 — el deploy que se aborta solo
-
-Se rompe la app a propósito, se despliega, y **el `deploy.sh` no conmuta**: baja las nuevas,
-sale con código 1, y el usuario nunca ve la versión rota.
-
-### Momento 7 — el rollback
-
-```bash
-./deploy/deploy.sh rollback
-```
-
-Vuelve a la versión anterior, que seguía viva al lado. Un comando.
+Lo que **sí** se demuestra igual: el reparto con round-robin, la expulsión por health check,
+el estado compartido, la auditoría cruzando bitácoras, el deploy sin downtime, el deploy que
+se aborta solo y el rollback.
 
 ---
 
-## Plan B — si el balanceador no llega
+## Reparto de roles
 
-Es el plan B que el enunciado permite declarar. **Hay que decirlo en voz alta y explicar qué
-se pierde:** las "casas" pasan a ser contenedores en una sola máquina, así que no se prueba
-la red entre casas ni la latencia real, y el balanceador es nuestro, no el de Plataforma.
-
-Todo lo demás se demuestra igual:
-
-```bash
-# 1. levantar réplicas y base
-./deploy/deploy.sh desplegar
-
-# 2. levantar nuestro conmutador apuntando a las que sirven
-CASA=casa-justino TP_LOGS=logs/conmutador \
-  java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.Conmutador \
-       8080 9090 localhost:8121,localhost:8122
-
-# 3. de acá en adelante, el guion de arriba con URL = localhost:8080
-export CONMUTADOR_ADMIN=http://localhost:9090/backends
-```
-
-Bajar todo al final:
-
-```bash
-pkill -f planb.Conmutador
-./deploy/deploy.sh bajar
-```
-
----
-
-## Si algo falla
-
-| Síntoma | Mirar |
+| Rol | Qué hace |
 | :--- | :--- |
-| `UNAVAILABLE` en personas | `TP_REDIS_URL`: ¿está seteada? ¿resuelve el host de la base? |
-| El contenedor no llega a `healthy` | `docker logs sdypp-java-green-1 \| tail -30` |
-| El balanceador no nos ve | ¿Habla HTTP/2 o L4? ¿Chequea `grpc.health.v1.Health`? |
-| El reparto no se ve | ¿El verificador usa canal compartido? Probar con `conexion` |
-| `docker stop` tarda 10 s | Normal: es el drenado. Con `grace` = 8 s debería salir antes |
+| **Terminal** | Corre los comandos de `manana.md`. Es el único que escribe |
+| **Relato** | Explica qué se está viendo y por qué. No toca el teclado |
+| **Bitácora** | Tiene proyectado `docker logs -f` y va señalando las líneas que aparecen |
 
-```bash
-docker ps -a
-docker inspect --format '{{.State.Health.Status}}' sdypp-java-green-1
-java -cp target/app-java.jar ar.edu.unlu.sdypp.Cliente localhost:8121 salud
-curl -s localhost:9090/estado     # sólo con el conmutador Plan B
-```
+El verificador lo corre **otro equipo, desde otra máquina** — nadie corrige su propio examen.
+A ellos hay que darles la URL del balanceador y el `.jar`, o decirles que usen `grpcurl`:
+nuestras réplicas exponen *reflection*, así que pueden llamarnos sin tener el `.proto`.
+
+---
+
+## Guion de la exposición
+
+| Momento | Qué se muestra | Comando |
+| :--- | :--- | :--- |
+| 1 | El reparto entre réplicas | `manana.md` · A |
+| 2 | El estado compartido: alta en una, lectura en otra | `manana.md` · B |
+| 3 | La auditoría cruzando las dos bitácoras | `manana.md` · C |
+| 4 | Matar una réplica: sale de rotación, los datos siguen | `manana.md` · D |
+| 5 | Deploy sin downtime con el loop corriendo | `manana.md` · E |
+| 6 | Deploy de una versión rota: aborta solo | `manana.md` · F |
+| 7 | Rollback en un comando | `manana.md` · G |
+
+---
+
+## Los tres aportes propios
+
+Los tres salieron de romper cosas midiendo, no de leer documentación. Están explicados en el
+`README.md`.
+
+1. **El formato ISO de Java omite los segundos cuando valen cero.** Una de cada sesenta
+   líneas de bitácora habría salido con otro formato, y el cruce con el log del balanceador
+   se rompe justo en esa.
+2. **El pool de conexiones a Redis reparte conexiones muertas.** Si la base se cae y vuelve,
+   la réplica queda respondiendo `UNAVAILABLE` para siempre: hay que reiniciarla a mano.
+3. **Nuestro propio balanceador se cayó solo bajo carga: 59,2 % de fallos**, sin que se
+   cayera ninguna réplica. Logueaba sincronizado a disco en cada conexión y declaraba muerto
+   un backend con un solo timeout vencido. Corregido: 59,2 % → 0,7 %.
