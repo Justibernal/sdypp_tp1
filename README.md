@@ -101,6 +101,32 @@ docker rm -f sdypp-java-1 sdypp-java-2 sdypp-redis
 Sin Docker: `./mvnw -q package` y
 `TP_REDIS_URL=redis://localhost:6379/0 java -jar target/app-java.jar 8080`.
 
+### El deploy blue-green
+
+```bash
+./deploy/deploy.sh desplegar   # construye, levanta el color libre AL LADO y conmuta
+./deploy/deploy.sh rollback    # vuelve al color anterior, que sigue corriendo
+./deploy/deploy.sh estado      # qué color sirve y cómo está cada réplica
+./deploy/deploy.sh bajar       # baja todo
+```
+
+Probado en los cuatro escenarios que pide el enunciado:
+
+| Escenario | Resultado |
+| :--- | :--- |
+| Primer deploy, nada sirviendo | `blue` v3 arriba y sirviendo |
+| Deploy de una versión nueva | `green` v4 al lado, verify, conmuta; `blue` queda viva |
+| Rollback | Vuelve a `blue` v3 en un comando; `green` sigue viva |
+| Deploy de una versión rota | `green` nunca llega a `healthy` → **aborta, baja las verdes, no conmuta, sale 1**; `blue` nunca dejó de servir |
+
+El `verify` no se conforma con un `healthy`: **compara la versión** que responde
+`Identidad` contra la declarada en `Config.VERSION`. Un ship a medias deja el contenedor
+sano corriendo la versión anterior, y eso pasaría un health check sin problema.
+
+La conmutación está aislada en `conmutar_a` / `color_activo`: es el único punto que depende
+del equipo Plataforma. Cuando definan la firma del endpoint se cambia ahí y nada más. Sin
+`CONMUTADOR_ADMIN` el deploy corre igual y avisa — es el modo de la demo local.
+
 ### El verificador
 
 ```bash
@@ -137,7 +163,7 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | ✅ | Base que vuelve → la réplica se recupera **sin reiniciarse** | Ver "Decisiones" |
 | ✅ | `SIGTERM` → `NOT_SERVING` → drenado → salida limpia | `docker stop` en 0,5 s |
 | ✅ | Contenedor no-root, `HEALTHCHECK` gRPC | `(healthy)` a los 20 s |
-| ⬜ | `deploy.sh` blue-green con abort y rollback | |
+| ✅ | `deploy.sh` blue-green con abort y rollback | 4 escenarios probados end-to-end |
 | ⬜ | Réplicas repartidas entre las tres casas (Tailscale) | |
 | ⬜ | Diagramas de arquitectura por etapa | |
 
