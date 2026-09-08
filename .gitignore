@@ -1,0 +1,8 @@
+target/
+logs/
+.env
+.idea/
+*.iml
+.DS_Store
+dependency-reduced-pom.xml
+deploy/.estado
