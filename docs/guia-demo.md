@@ -191,3 +191,23 @@ Los tres salieron de romper cosas midiendo, no de leer documentación. Están ex
 3. **Nuestro propio balanceador se cayó solo bajo carga: 59,2 % de fallos**, sin que se
    cayera ninguna réplica. Logueaba sincronizado a disco en cada conexión y declaraba muerto
    un backend con un solo timeout vencido. Corregido: 59,2 % → 0,7 %.
+
+---
+
+## Las mejoras al enunciado
+
+El enunciado pide al menos tres. Están en
+**[`mejoras-al-enunciado.md`](mejoras-al-enunciado.md)**, con el detalle y la evidencia. En una
+línea cada una, para decirlas de memoria:
+
+1. **"Menos de cien líneas" presupone HTTP/1.1.** Con gRPC hay que elegir entre L4 y L7, y el
+   enunciado no obliga a declarar cuál ni qué se pierde. Nosotros lo medimos: con canal
+   compartido, un balanceador L4 manda **el 100 % a una sola réplica**.
+2. **La auditoría se pide cruzando timestamps, y el propio enunciado admite que los relojes de
+   las casas difieren.** Falta un **id de correlación** en el contrato de logging: convierte el
+   cruce en un `grep` exacto y lo saca de la dependencia del reloj.
+3. **Pide health checks pero no define los umbrales.** Ni cuántos fallos expulsan, ni cuántos
+   aciertos reincorporan, ni por qué no son el mismo número. A nosotros un solo timeout vencido
+   nos dejó el pool vacío **con las dos réplicas sanas**.
+4. **La tarea elimina tres puntos únicos de falla e introduce uno nuevo —la base compartida— y lo
+   menciona recién al final, entre los Picantes.**
