@@ -14,8 +14,8 @@ diferencia, manda el contrato, no este README.
 ## Integrantes
 
 * **María Agustina Ortiz** — Legajo *(completar)*
-* **Justino Bernal** — Legajo *(190118)*
-* **Federico Kasparian …** — Legajo *(completar)*
+* **Justino Bernal** — Legajo 190118
+* **Federico Nicolás Kasparian** — Legajo *(completar)*
 
 ---
 
