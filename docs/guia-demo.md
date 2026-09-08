@@ -173,8 +173,8 @@ nuestras réplicas exponen *reflection*, así que pueden llamarnos sin tener el 
 | 3 | La auditoría cruzando las dos bitácoras | `manana.md` · C |
 | 4 | Matar una réplica: sale de rotación, los datos siguen | `manana.md` · D |
 | 5 | Deploy sin downtime con el loop corriendo | `manana.md` · E |
-| 6 | Deploy de una versión rota: aborta solo | `manana.md` · F |
-| 7 | Rollback en un comando | `manana.md` · G |
+| 6 | Rollback en un comando | `manana.md` · F |
+| 7 | Deploy de una versión rota: aborta solo | `manana.md` · G |
 
 ---
 

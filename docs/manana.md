@@ -64,7 +64,16 @@ ls -lh target/app-java.jar
 
 **Se espera:** el comando no imprime nada, y el jar pesa **≈ 22 MB**.
 
-## Paso 4 · Levantar la base y las réplicas
+## Paso 4 · Empezar con las bitácoras limpias
+
+Las bitácoras se acumulan entre corridas. Si quedan las de ayer, el momento **C** de la demo
+(la auditoría) devuelve también líneas viejas y no se entiende nada.
+
+```bash
+rm -rf logs/blue logs/green logs/conmutador
+```
+
+## Paso 5 · Levantar la base y las réplicas
 
 ```bash
 ./deploy/deploy.sh desplegar
@@ -73,9 +82,9 @@ ls -lh target/app-java.jar
 Tarda unos **15 segundos**. **Se espera**, al final:
 
 ```
-[  ok  ] sdypp-java-<color>-1 sano y sirviendo v7
-[  ok  ] sdypp-java-<color>-2 sano y sirviendo v7
-[  ok  ] sirviendo <color> (v7)
+[  ok  ] sdypp-java-<color>-1 sano y sirviendo vN
+[  ok  ] sdypp-java-<color>-2 sano y sirviendo vN
+[  ok  ] sirviendo <color> (vN)
 
   color activo: <color>
   sdypp-java-<color>-1   running   healthy   81x1
@@ -88,7 +97,7 @@ Ese único comando levantó Redis, construyó la imagen y arrancó **dos réplic
 > se despliega sin cortar el servicio. **No hace falta acordarse de cuál está activo:** el
 > paso siguiente lo averigua solo.
 
-## Paso 5 · Cargar el entorno de trabajo
+## Paso 6 · Cargar el entorno de trabajo
 
 ```bash
 source deploy/entorno.sh
@@ -111,10 +120,10 @@ los usa.
 > **Hay que repetirlo en cada pestaña nueva de la terminal**, y también después de cada
 > deploy, porque el color cambia.
 
-## Paso 6 · Levantar el balanceador
+## Paso 7 · Levantar el balanceador
 
 **Sólo con el Plan B**, es decir, si el balanceador no lo pone el equipo Plataforma. Si lo
-ponen ellos, saltá al Paso 7 y usá la URL que te den:
+ponen ellos, saltá al Paso 8 y usá la URL que te den:
 
 ```bash
 export URL=<la-url-que-den>
@@ -138,9 +147,9 @@ Conmutador (PLAN B) escuchando en 0.0.0.0:8080 · admin en :9090
 [conmutador] backends: localhost:8121(sano), localhost:8122(sano)
 ```
 
-Los dos backends tienen que decir **`(sano)`**. Si alguno dice `(caido)`, volvé al Paso 4.
+Los dos backends tienen que decir **`(sano)`**. Si alguno dice `(caido)`, volvé al Paso 5.
 
-## Paso 7 · Probar que todo responde
+## Paso 8 · Probar que todo responde
 
 Volvé a la primera pestaña.
 
@@ -158,7 +167,7 @@ Si esto anda, **el sistema está listo**.
 > Los nombres con acento se ven escapados (`Mar\303\255a`). Es normal: así imprime el formato
 > de texto de Protobuf. En el mensaje que viaja por la red el acento va bien.
 
-## Paso 8 · Dejar la bitácora proyectada
+## Paso 9 · Dejar la bitácora proyectada
 
 Tercera pestaña, y no se toca más:
 
@@ -201,15 +210,33 @@ igual. Eso prueba que el estado vive en la base y no en las instancias.
 
 ## C · La auditoría cruzada
 
-Con el `id` del paso B:
+Con el `id` que devolvió el paso B — reemplazá `<ID>` por ese número:
 
 ```bash
 grep "id=<ID>" $LOGS/bitacora-*.log
-tail -5 logs/conmutador/bitacora-conmutador.log
 ```
 
-**Se espera:** el primero muestra **qué hizo** la réplica; el segundo, **a quién derivó** el
-balanceador. Dos archivos, dos piezas, una sola operación reconstruida.
+**Se espera:** una línea que dice **qué hizo** la réplica y **cuál** de las dos fue:
+
+```
+logs/green/bitacora-...-green-2.log:2026-09-08T14:03:22-03:00 | java@casa-justino | CrearPersona | OK | id=7
+```
+
+Tomá el **segundo exacto** de esa línea (en el ejemplo, `14:03:22`) y buscalo en la bitácora
+del balanceador:
+
+```bash
+grep "14:03:22" logs/conmutador/bitacora-conmutador.log
+```
+
+**Se espera:** las conexiones que el balanceador derivó en ese mismo segundo, cada una
+diciendo **a qué réplica** la mandó.
+
+Dos archivos, dos piezas del sistema, una sola operación reconstruida. Eso es la auditoría
+que pide el enunciado.
+
+> El balanceador registra `CONEXION` y no el nombre del RPC porque trabaja a nivel TCP: a ese
+> nivel no ve qué RPC pasó. Está explicado en `diagramas.md`, diagrama 7.
 
 ## D · Matar una réplica
 
@@ -259,35 +286,48 @@ Recargá el entorno, porque el color cambió:
 source deploy/entorno.sh
 ```
 
-## F · El deploy que se aborta solo
+## F · El rollback
 
-Se rompe la app a propósito y se intenta deployar:
+La versión anterior nunca se bajó: sigue corriendo al lado. Volver a ella es un comando.
 
 ```bash
-python3 - <<'PY'
+./deploy/deploy.sh rollback
+source deploy/entorno.sh
+c $URL identidad | grep -E "version|mensaje"
+```
+
+**Se espera:** `rollback hecho`, y el servicio vuelve a responder la versión anterior.
+
+## G · El deploy que se aborta solo
+
+Se rompe la aplicación a propósito y se intenta desplegar. Copiá el bloque entero:
+
+```bash
+python3 -c '
 import pathlib
 p = pathlib.Path("src/main/java/ar/edu/unlu/sdypp/AppJava.java")
 s = p.read_text()
 p.write_text(s.replace("int puerto = Config.puerto(args);",
-    'if (true) throw new IllegalStateException("version rota");\n        int puerto = Config.puerto(args);'))
-print("app rota a proposito")
-PY
-./deploy/version.sh 9
+    "if (true) throw new IllegalStateException(\"version rota\");\n        int puerto = Config.puerto(args);"))
+print("aplicacion rota a proposito")
+'
+./deploy/version.sh 99
 ./deploy/deploy.sh desplegar; echo "codigo de salida: $?"
 ```
 
 Tarda alrededor de un minuto esperando el health check. **Se espera:**
 
 ```
+[ERROR ] ... no llegó a healthy en 60s (estado: unhealthy)
 [ERROR ] ABORTA: se bajan todas las réplicas ... y NO se conmuta
 [ERROR ] las ... nunca dejaron de servir; el usuario no vio la versión rota
 codigo de salida: 1
 ```
 
-Y el servicio sigue respondiendo la versión buena:
+Y el servicio sigue respondiendo la versión buena, sin que el usuario se entere de nada:
 
 ```bash
-c $URL identidad | grep version
+c $URL identidad | grep -E "version|mensaje"
 ```
 
 **Dejá el código como estaba:**
@@ -297,15 +337,10 @@ git checkout src/main/java/ar/edu/unlu/sdypp/AppJava.java
 ./deploy/version.sh 8
 ```
 
-## G · El rollback
-
-```bash
-./deploy/deploy.sh rollback
-source deploy/entorno.sh
-c $URL identidad | grep -E "version|mensaje"
-```
-
-**Se espera:** vuelve a la versión anterior, que seguía viva al lado. **Un comando.**
+> **Este momento va último a propósito.** Al abortar, el deploy baja las réplicas del color
+> que intentó levantar, así que después queda un solo color corriendo y ya no hay a dónde
+> hacer rollback. Para repetir la demo desde el principio, corré `./deploy/deploy.sh
+> desplegar` una vez y volvés a tener los dos colores vivos.
 
 ---
 
@@ -332,7 +367,7 @@ pkill -f planb.Conmutador
 | El conmutador dice `(caido)` | `docker inspect --format '{{.State.Health.Status}}' $REPLICA_1` |
 | El reparto no se ve | Agregá `conexion` al final del comando `v carga` |
 | `docker stop` tarda unos segundos | Es normal: es el drenado de las peticiones en curso |
-| Todo raro | `./deploy/deploy.sh bajar` y volvé al Paso 4 |
+| Todo raro | `./deploy/deploy.sh bajar` y volvé al Paso 5 |
 
 Diagnóstico general:
 

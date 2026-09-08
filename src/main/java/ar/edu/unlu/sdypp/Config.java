@@ -14,8 +14,8 @@ public final class Config {
 
     public static final String APP = "java";
     public static final String LENGUAJE = "Java " + System.getProperty("java.version");
-    public static final int VERSION = 7;
-    public static final String MENSAJE = "hola mundo java v7";
+    public static final int VERSION = 8;
+    public static final String MENSAJE = "hola mundo java v8";
 
     /**
      * Un Integrante por persona: el legajo es un campo propio y no un dato embutido
