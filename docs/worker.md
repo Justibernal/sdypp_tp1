@@ -169,9 +169,32 @@ Desktop apagado en esa máquina).
 | ✅ | Cola caída al arrancar | Backoff exponencial, 8 reintentos, se recuperó sola al levantarla |
 | ✅ | Base caída | `UNAVAILABLE` por la cola, igual que por gRPC; el resto de las tareas sigue saliendo `OK` |
 | ✅ | Bitácora con el sexto campo | **101 líneas, 0 fuera de formato** |
+| ✅ | **Worker muerto de golpe con una tarea en la mano** | **3000 de 3000 respondidas, 0 perdidas** |
+| ✅ | Reserva vencida → reasignación al otro worker | `reasignados: 1`, y la tarea la terminó el otro |
 | ⬜ | `docker stop` → drenado → soltar lo no empezado | Falta: necesita Docker corriendo |
-| ⬜ | Reserva vencida → reasignación al otro worker | Falta: hay que matar un worker con una tarea en la mano |
 | ⬜ | Alta real contra Redis y lectura desde la otra casa | Falta: necesita Docker corriendo |
+
+**La corrida larga: un worker que se muere de golpe.** 3000 tareas publicadas en flujo
+continuo, con un solo consumidor drenándolas (~340 por segundo). A mitad de camino se le
+manda `kill -9` al worker, **con una tarea en la mano** — sin señal, sin drenado, sin aviso:
+igual que una casa que se queda sin luz. La cola no puede enterarse por él; se entera porque
+**le vence la reserva**.
+
+```
+al matarlo   enVuelo: 1                      ← la tarea huérfana
+al final     reasignados: 1 · respondidos: 3000 · descartados: 0
+reparto      worker-a 2361 · worker-b 639     (= 3000)
+bitácoras    2361 + 639 = 3000 líneas          sin duplicados
+```
+
+**3000 de 3000, cero perdidas.** La tarea huérfana la terminó el otro worker diez segundos
+después, que es lo que dura la reserva. Y que las dos bitácoras sumen exactamente 3000 es la
+otra mitad del resultado: la tarea se reasignó, pero **no se ejecutó dos veces**.
+
+Es el equivalente, del lado de la cola, a las 12000/12000 con deploy y rollback de la Etapa
+1 — con una diferencia que vale la pena decir en la defensa: allá el servicio seguía en pie
+porque el deploy tuvo cuidado; acá se murió un proceso de la peor manera posible y **nadie
+tuvo que hacer nada**.
 
 **Un hallazgo del reparto.** La primera ronda dio **34 / 6** y la segunda **21 / 19**, con
 las mismas 40 tareas. No es un error: el primer worker ya estaba estacionado en su GET de

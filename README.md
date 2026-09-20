@@ -205,7 +205,8 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | ✅ | **Worker:** los casos borde que el JSON reabre | **11/11** con el código y el mensaje del contrato |
 | ✅ | **Worker:** dos consumidores compitiendo | 21/19 sobre 40 tareas, con los dos esperando |
 | ✅ | **Worker:** cola caída y recuperada | Backoff exponencial, se recuperó sin reiniciar |
-| ⬜ | **Worker:** `docker stop`, reserva vencida y alta real contra Redis | Falta Docker corriendo — ver [`docs/worker.md`](docs/worker.md) |
+| ✅ | **Worker:** muerto de golpe con una tarea en la mano | **3000 de 3000 respondidas, 0 perdidas** · la huérfana la terminó el otro |
+| ⬜ | **Worker:** `docker stop` y alta real contra Redis | Falta Docker corriendo — ver [`docs/worker.md`](docs/worker.md) |
 | ✅ | Diagramas: arquitectura por etapa, flujo del deploy, secuencias y worker de cola | [`docs/diagramas.md`](docs/diagramas.md) |
 | ✅ | Auditoría punto por punto contra el contrato v2.2 | 2 huecos encontrados y cerrados |
 
