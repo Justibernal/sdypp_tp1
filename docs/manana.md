@@ -417,7 +417,7 @@ ssh -p <PUERTO> <USUARIO>@<HOST>
 
 # Anexo 4 · Si corrés en Windows (Git Bash)
 
-Todo el proyecto anda igual, pero hay cuatro diferencias. Las tres primeras ya están
+Todo el proyecto anda igual, pero hay cinco diferencias. Las tres primeras ya están
 resueltas en el código; la cuarta la tenés que poner vos.
 
 **1 · Se usa Git Bash, no PowerShell.** Los scripts son `bash`. Abrí *Git Bash* y usá `sh
@@ -439,6 +439,29 @@ export CASA=casa-agustina
 ```
 
 Con eso, `deploy.sh` y el conmutador la toman solos y no hay que repetirla en cada comando.
+
+**5 · Windows se reserva rangos de puertos, y el color `blue` puede caer adentro.**
+Hyper-V / WinNAT se quedan con rangos enteros de puertos TCP, y en algunas máquinas el
+`8054–8253` está reservado — ahí caen **8101, 8102** (los del README) y **8111, 8112** (los
+del color `blue` del deploy). El síntoma es el deploy abortando con:
+
+```
+docker: Error response from daemon: ports are not available: ...
+bind: An attempt was made to access a socket in a way forbidden by its access permissions
+```
+
+No es que el puerto esté ocupado: está **excluido**. Para ver los rangos de tu máquina:
+
+```bash
+netsh interface ipv4 show excludedportrange protocol=tcp
+```
+
+Si `8110–8113` cae adentro, el deploy no puede levantar `blue` (el `green`, en 8121/8122,
+suele quedar afuera). Sale de a dos maneras: reiniciando `winnat`
+(`net stop winnat && net start winnat`, en una consola como administrador — los rangos se
+reasignan y suelen moverse), o cambiando `PUERTO_BASE_blue` en `deploy/deploy.sh` por algo
+fuera del rango. **Chequealo antes de la demo, no durante.**
+
 
 ### Arranque completo en Windows
 
