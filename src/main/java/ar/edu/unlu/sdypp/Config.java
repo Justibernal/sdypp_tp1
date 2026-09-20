@@ -50,6 +50,22 @@ public final class Config {
     public static final String DIRECTORIO_LOGS = env("TP_LOGS", "logs");
     public static final int WORKERS = Integer.parseInt(env("TP_WORKERS", "10"));
 
+    /**
+     * Worker de la cola. La cola es un servicio de otro equipo, así que TODO lo que
+     * depende de su especificación entra por variable de entorno: el día que publiquen una
+     * URL distinta, o cambien el nombre de un parámetro, no hay que recompilar nada.
+     *
+     * COLA_CONSUMIDOR identifica a este worker ante la cola. Lleva el HOST_NAME y no la
+     * CASA porque la cola cuenta los pedidos en vuelo por consumidor: dos workers de la
+     * misma casa tienen que poder distinguirse, igual que las réplicas en la bitácora
+     * (CONTRATO.md §5).
+     */
+    public static final String COLA_URL = env("TP_COLA_URL", "");
+    public static final String COLA_CONSUMIDOR = env("TP_COLA_CONSUMIDOR", APP + "@" + HOST);
+    public static final int COLA_HILOS = Integer.parseInt(env("TP_COLA_HILOS", "2"));
+    public static final int COLA_ESPERA = Integer.parseInt(env("TP_COLA_ESPERA", "20"));
+    public static final int COLA_ADMIN = Integer.parseInt(env("TP_COLA_ADMIN", "9091"));
+
     /** Momento de arranque de esta réplica. Se calcula una sola vez. */
     public static final String ARRANCADO = ahoraIso();
 

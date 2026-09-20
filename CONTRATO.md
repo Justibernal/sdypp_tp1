@@ -1,7 +1,8 @@
 # Contrato de servicio — App Java ↔ App Python
 
 **v2.2 · gRPC + Protobuf** — lo que las dos implementaciones tienen que responder **igual** para
-ser intercambiables detrás del balanceador.
+ser intercambiables detrás del balanceador. La **§8 es la propuesta v2.3**: el mismo servicio
+alcanzado por una cola de tareas, pendiente de cerrar con el equipo que la implementa.
 
 El esquema formal está en **[`contrato.proto`](contrato.proto)**. Acá va lo que el `.proto` no
 puede expresar: validación, orden de los chequeos y semántica de los errores.
@@ -195,7 +196,145 @@ Condiciones sin las cuales el balanceador no puede reenviar tráfico.
 
 ---
 
-## 8. Versiones
+## 8. La cola de tareas — propuesta v2.3
+
+> **Estado: propuesta.** La cola la implementa otro equipo y su capa HTTP todavía no está
+> publicada. Esto es lo que la App Java ya implementa y contra lo que está probada; lo que
+> haya que ajustar cuando publiquen su especificación se ajusta acá, y sube la versión.
+> Las preguntas abiertas están en [`docs/worker.md`](../docs/worker.md).
+
+El mismo servicio, por un segundo camino: en vez de atender una conexión gRPC, un **worker**
+toma el pedido de una cola, lo resuelve y devuelve la respuesta. El cliente deja de esperar
+contra una conexión abierta, y el que resuelve deja de necesitar ser alcanzable.
+
+### 8.1 · Las dos colas
+
+| Cola | Quién publica | Quién consume |
+| :--- | :--- | :--- |
+| `pedidos` | El balanceador | **Los workers**, compitiendo: el que está libre toma el próximo |
+| `respuestas` | Los workers | El balanceador, y sólo el que es su destinatario |
+
+Dos colas y no una bidireccional: en `pedidos` hay N consumidores compitiendo por el mismo
+elemento; en `respuestas` cada elemento tiene **un** destinatario y nadie más lo puede tomar.
+
+### 8.2 · El endpoint del worker
+
+Las tres operaciones van contra la **misma URL** (`TP_COLA_URL`), y se distinguen por el
+verbo:
+
+| | Qué hace | Respuesta |
+| :--- | :--- | :--- |
+| `GET ?consumidor=<id>&espera=<s>` | Toma el próximo pedido y lo **reserva** | `200` con el pedido · `204` si no hubo nada en `<s>` |
+| `POST` | Devuelve la tarea resuelta | `2xx` aceptada · `409` la tarea ya no existe |
+| `DELETE ?id=<id>&consumidor=<id>` | Suelta un pedido sin resolver (al apagarse) | `2xx` devuelto · `404` no estaba en vuelo |
+
+El `GET` es de **long-polling**: el worker se queda esperando hasta `espera` segundos y lo
+despiertan apenas hay trabajo. Con polling corto habría cientos de requests por minuto sin
+trabajo, y cada pedido se vería con el retraso del intervalo.
+
+### 8.3 · El sobre
+
+**Pedido** — lo que el worker recibe:
+
+```json
+{"id": "a3f9", "operacion": "POST /personas",
+ "parametros": {"nombre": "Ada Lovelace", "legajo": 100200},
+ "idempotente": false, "cliente": "10.0.0.7", "quedaMs": 4200, "intento": 0}
+```
+
+**Respuesta** — lo que el worker devuelve:
+
+```json
+{"id": "a3f9", "estado": "OK", "atendidoPor": "java@casa-justino-worker-1", "app": "java",
+ "contenido": {"servido_por": "java",
+               "persona": {"id": 7, "nombre": "Ada Lovelace", "legajo": 100200}}}
+```
+
+| Campo | Contenido |
+| :--- | :--- |
+| `id` | El de la tarea, tal cual vino. Es lo que la cola usa para cerrarla |
+| `estado` | **Nombre del código gRPC**: `OK`, `INVALID_ARGUMENT`, `ALREADY_EXISTS`, `UNAVAILABLE`, `UNIMPLEMENTED`, `DEADLINE_EXCEEDED` |
+| `contenido` | El mensaje del contrato en JSON, **con los nombres de campo del `.proto`** (`servido_por`, no `servidoPor`) |
+| `atendidoPor` | El mismo identificador que el worker manda como `consumidor` |
+| `app` | `"java"` o `"python"`, como en el resto del contrato |
+
+El `destinatario`, los `intentos` y la espera los completa **la cola** con lo que guardó del
+pedido: el worker no tiene por qué saber quién lo pidió, y si se lo preguntáramos podría
+mentir.
+
+Un fallo va con el código en `estado` y el motivo en el contenido, que es la misma forma que
+usa la cola cuando falla por su cuenta:
+
+```json
+{"id": "a3f9", "estado": "INVALID_ARGUMENT",
+ "contenido": {"error": "legajo fuera de rango", "app": "java"}}
+```
+
+### 8.4 · Las operaciones
+
+`operacion` nombra la request HTTP que originó el pedido, porque es lo que recibe el
+balanceador. La equivalencia con los RPC es la misma de la v1.3 → v2.0:
+
+| `operacion` | RPC | `parametros` | Idempotente |
+| :--- | :--- | :--- | :--- |
+| `GET /` | `Identidad` | — | sí |
+| `GET /health` | `Salud` | — | sí |
+| `POST /echo` | `Echo` | `ping` | sí |
+| `GET /personas` | `ListarPersonas` | — | sí |
+| `POST /personas` | `CrearPersona` | `nombre`, `legajo` | **no** |
+
+Una operación que no está en la tabla se responde `UNIMPLEMENTED`, nunca con una excepción:
+el pedido llegó bien y el problema es el catálogo, así que reintentarlo no cambiaría nada.
+
+### 8.5 · Los trece casos borde vuelven
+
+La §3 celebra que el tipado de Protobuf eliminó trece casos borde que la v1.3 validaba a
+mano. Por la cola viaja JSON: **vuelven todos**, porque ya no hay stub del cliente que los
+rechace antes de salir a la red. La conversión los resuelve, y la regla es que **no inventa
+errores nuevos** — los mapea a los que el contrato ya define:
+
+| Llega | Se convierte en | Resultado |
+| :--- | :--- | :--- |
+| `"legajo": "100200"` | `100200` | Se acepta: un formulario manda todo como texto |
+| `"legajo": 100.5` · `1e5` · `true` · `"abc"` · ausente | `0` | `INVALID_ARGUMENT · legajo fuera de rango` |
+| `"legajo": 3000000000` | `0` | `INVALID_ARGUMENT · legajo fuera de rango` |
+| `"nombre": 42` · `{}` · `[]` | ausente | `INVALID_ARGUMENT · se requieren los campos nombre y legajo` |
+
+El orden de los chequeos de la §3 se respeta igual: ante un pedido con dos problemas a la
+vez, el worker devuelve el mismo error que devolvería el servidor gRPC.
+
+### 8.6 · Reintentos y entrega
+
+| Situación | Quién la resuelve | Cómo |
+| :--- | :--- | :--- |
+| El worker se muere con la tarea en la mano | La cola | Vence la reserva. **Idempotente:** vuelve al frente. **Escritura:** `DEADLINE_EXCEEDED` |
+| El worker se apaga ordenadamente | El worker | Termina la que está resolviendo y **suelta** (`DELETE`) la que no empezó |
+| El `POST` de la respuesta falla | El worker | Reintenta **la entrega**, nunca la ejecución: la tarea ya se ejecutó |
+| La respuesta llega segunda | La cola | La descarta (`409`). Gana la primera |
+| La cola no responde | El worker | Backoff exponencial hasta 15 s. **No** se declara enfermo por eso |
+
+**Una escritura no se reencola.** Al vencer una reserva, la cola sabe que el worker no
+contestó, pero no si llegó a ejecutar: repetir una lectura no cuesta nada, repetir un alta
+puede crear la persona dos veces. Un `DEADLINE_EXCEEDED` honesto es mejor que un duplicado
+silencioso.
+
+### 8.7 · Bitácora: el sexto campo
+
+La línea del worker lleva los cinco campos de la §5 sin tocar, y **un sexto**:
+
+```
+2026-09-08T14:03:22-03:00 | java@casa-justino | CrearPersona | OK | id=7 | tarea=a3f9
+```
+
+`tarea=<id>` es el **id de correlación** que el contrato no tiene y que la auditoría
+necesita: cruzar dos bitácoras por timestamp exige que los relojes de dos casas coincidan, y
+el propio enunciado dice que los relojes mienten. La cola nos da un id que identifica la
+operación de punta a punta; anotarlo cuesta un campo. Es la mejora nº2 que le levantamos al
+enunciado, resuelta.
+
+---
+
+## 9. Versiones
 
 | | Cambios |
 | :--- | :--- |
@@ -203,3 +342,4 @@ Condiciones sin las cuales el balanceador no puede reenviar tráfico.
 | **2.0** | **Cambio incompatible: HTTP/JSON → gRPC sobre HTTP/2 con Protobuf.** Códigos HTTP → códigos gRPC. Trece casos borde desaparecen por el tipado. Se agregan health estándar, contenedores y los requisitos de §7. |
 | 2.1 | Salen el RPC `Lenta`, el checksum y el rate limiting: el grupo decidió no usarlos. |
 | **2.2** | Un mensaje de pedido propio por método (`IdentidadPedido`, `SaludPedido`, `ListarPersonasPedido`) en vez de uno compartido. `EstadoSalud.status` pasa de string a **enumerado**. |
+| **2.3** *(propuesta)* | **Segundo camino al mismo servicio: la cola de tareas (§8).** Sobre de pedido y de respuesta, catálogo de operaciones, códigos gRPC como `estado`, la regla de reintento por idempotencia, y la conversión de JSON a los tipos del contrato — que reabre los trece casos borde que la 2.0 había cerrado. La bitácora suma un sexto campo opcional, `tarea=<id>`, que es el id de correlación que faltaba. |

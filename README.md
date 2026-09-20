@@ -59,12 +59,18 @@ despliega.
 | :--- | :--- |
 | `AppJava` | `main`. Arma el server gRPC, registra los servicios, y el graceful shutdown. |
 | `Config` | Todo lo que viene por variable de entorno + las constantes que son contrato. |
-| `ServicioImpl` | Los cinco RPC. Validación en el orden que fija el contrato. |
+| `Operaciones` | **Las cinco operaciones del contrato, sin transporte.** Validación en el orden que fija el contrato. La usan el servidor gRPC y el worker: una sola implementación para los dos caminos. |
+| `ServicioImpl` | El transporte gRPC. Traduce el resultado a códigos y mensajes. |
 | `RepositorioPersonas` | Redis: esquema de claves y el script Lua del alta atómica. |
-| `Bitacora` | Una línea por RPC al disco local, un archivo por réplica. |
+| `Bitacora` | Una línea por operación al disco local, un archivo por réplica. |
 | `Cliente` | CLI para probar a mano. Con gRPC no alcanza un `curl`. |
 | `Verificador` | El de la demo: dispara N requests, cuenta códigos y reparto. |
 | `Healthcheck` | Lo que corre el `HEALTHCHECK` del contenedor. Sale 0 si `SERVING`. |
+| `worker.Worker` | **El servicio que consume la cola.** `main`, los consumidores, el panel y el apagado ordenado. |
+| `worker.ClienteCola` | El HTTP contra la cola. Todo lo que depende de su especificación vive acá. |
+| `worker.Tarea` | El sobre del pedido, con la tolerancia de formato. |
+| `worker.Ejecutor` | La frontera: JSON sin tipos ↔ mensajes del contrato. |
+| `planb.ColaFalsa` | Doble de prueba de la cola, para demostrar sin el servicio del otro equipo. |
 
 ---
 
@@ -127,6 +133,29 @@ La conmutación está aislada en `conmutar_a` / `color_activo`: es el único pun
 del equipo Plataforma. Cuando definan la firma del endpoint se cambia ahí y nada más. Sin
 `CONMUTADOR_ADMIN` el deploy corre igual y avisa — es el modo de la demo local.
 
+### El worker de cola
+
+Además del servidor gRPC, el mismo servicio se alcanza por una **cola de tareas**: un worker
+toma el pedido, lo resuelve y devuelve la respuesta. Corre en su propio contenedor, se
+escala solo y **no escucha ningún puerto de servicio** — nadie le habla, es él quien va a
+buscar trabajo.
+
+```bash
+export TP_COLA_URL=<la-url-de-la-cola>
+./deploy/worker.sh levantar 2     # construye y levanta 2 workers
+./deploy/worker.sh estado         # cuánto resolvió cada uno
+./deploy/worker.sh escalar 4      # agregar capacidad: no se toca ni la cola ni el balanceador
+```
+
+Mientras la cola del otro equipo no esté publicada, `planb.ColaFalsa` la reemplaza para
+poder probar y demostrar. Todo —cómo levantarlo, las decisiones, lo verificado y las
+preguntas abiertas— está en **[`docs/worker.md`](docs/worker.md)**; el contrato de la cola,
+en [`CONTRATO.md §8`](CONTRATO.md).
+
+La línea de bitácora del worker lleva un sexto campo, `tarea=<id>`: es el **id de
+correlación** que faltaba para auditar sin depender de que los relojes de dos casas
+coincidan.
+
 ### El verificador
 
 ```bash
@@ -148,6 +177,8 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | `TP_REDIS_URL` | Base compartida. **Lleva la contraseña: no se versiona.** | vacío → personas da `UNAVAILABLE` |
 | `TP_WORKERS` | Hilos que atienden RPCs a la vez. | `10` |
 | `TP_LOGS` | Directorio de la bitácora. | `logs` |
+| `TP_COLA_URL` | URL del servicio de cola. La misma para el GET y el POST. Sólo la usa el worker. | vacío |
+| `TP_COLA_HILOS` · `TP_COLA_ESPERA` · `TP_COLA_ADMIN` · `TP_COLA_CONSUMIDOR` | Del worker. Ver [`docs/worker.md`](docs/worker.md). | `2` · `20` · `9091` · `java@$HOST_NAME` |
 
 ---
 
@@ -170,17 +201,23 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | ✅ | Réplica muerta → sale de rotación, el loop sigue | 100/100 OK con una réplica caída |
 | ✅ | Los siete momentos de la demo, en una segunda casa y otro SO | Windows + Git Bash; 2 fallas de portabilidad encontradas y cerradas |
 | ⬜ | Réplicas repartidas entre las tres casas (Tailscale) | |
-| ✅ | Diagramas: arquitectura por etapa, flujo del deploy y secuencias | [`docs/diagramas.md`](docs/diagramas.md) |
+| ✅ | **Worker de cola:** ciclo tomar → resolver → responder | 101 tareas, **101 respondidas, 0 perdidas** |
+| ✅ | **Worker:** los casos borde que el JSON reabre | **11/11** con el código y el mensaje del contrato |
+| ✅ | **Worker:** dos consumidores compitiendo | 21/19 sobre 40 tareas, con los dos esperando |
+| ✅ | **Worker:** cola caída y recuperada | Backoff exponencial, se recuperó sin reiniciar |
+| ⬜ | **Worker:** `docker stop`, reserva vencida y alta real contra Redis | Falta Docker corriendo — ver [`docs/worker.md`](docs/worker.md) |
+| ✅ | Diagramas: arquitectura por etapa, flujo del deploy, secuencias y worker de cola | [`docs/diagramas.md`](docs/diagramas.md) |
 | ✅ | Auditoría punto por punto contra el contrato v2.2 | 2 huecos encontrados y cerrados |
 
 ---
 
 ## Diagramas
 
-En [`docs/diagramas.md`](docs/diagramas.md) — GitHub los renderiza solo. Son siete:
+En [`docs/diagramas.md`](docs/diagramas.md) — GitHub los renderiza solo. Son nueve:
 arquitectura de las Etapas 1, 2 y 3; el flujo del deploy con abort y rollback; la secuencia
 del reparto con ejección por health check; la del alta atómica con dos réplicas
-compitiendo; y el hallazgo del L4.
+compitiendo; el hallazgo del L4; y la arquitectura del worker de cola con la secuencia de
+una tarea, incluidos los dos casos feos.
 
 Las imágenes sueltas están en `docs/img/` (PNG y SVG, para pegar en la presentación) y
 `docs/diagramas.html` es un visor para proyectar. Los tres salen del mismo `.md`:

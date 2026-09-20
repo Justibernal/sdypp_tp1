@@ -1,8 +1,8 @@
-# Diagramas — App Java · Tarea Clase 2
+# Diagramas — App Java
 
-Cinco diagramas: la arquitectura de cada etapa, el flujo del deploy y las dos secuencias
-que explican por qué el sistema aguanta. Lo que está implementado y medido va en línea
-llena; lo propuesto, punteado.
+Nueve diagramas: la arquitectura de cada etapa, el flujo del deploy, las secuencias que
+explican por qué el sistema aguanta, y la arquitectura del **worker de cola** (8 y 9). Lo
+que está implementado y medido va en línea llena; lo propuesto, punteado.
 
 ---
 
@@ -309,3 +309,150 @@ compartido, **50/50 exacto** con canal por request.
 
 Repartir **por RPC** exige subir a L7 y entender HTTP/2. Es la decisión grande que le queda
 al equipo Plataforma.
+
+---
+
+## 8 · Arquitectura — el worker de cola
+
+El cliente deja de esperar contra una conexión abierta: su pedido se publica en una cola y
+el worker que esté libre lo toma. **Nadie asigna trabajo** — no hay round-robin, no hay
+lista de backends, no hay health checks del lado del que reparte.
+
+```mermaid
+flowchart LR
+    CLI["Cliente"] --> BAL
+
+    BAL["BALANCEADOR<br/>publica el pedido<br/>recolecta la respuesta"]
+
+    subgraph COLA ["SERVICIO DE COLA — otro equipo"]
+        PED[["pedidos<br/>FIFO · reserva por consumidor<br/>presupuesto por pedido"]]
+        RES[["respuestas<br/>indexadas por destinatario"]]
+        REC["recuperador<br/>reserva vencida:<br/>idempotente → reencola<br/>escritura → DEADLINE_EXCEEDED"]
+    end
+
+    BAL -->|"publicar"| PED
+    RES -->|"recolectar"| BAL
+    PED -.-> REC
+    REC -.->|"el que nadie contestó"| RES
+
+    subgraph CJ ["casa-justino"]
+        W1["WORKER<br/>2 consumidores<br/>panel :9101"]
+        L1["bitácora<br/>… | CrearPersona | OK | id=7 | tarea=a3f9"]
+    end
+
+    subgraph CA ["casa-agustina"]
+        W2["WORKER<br/>2 consumidores<br/>panel :9102"]
+        L2["bitácora"]
+    end
+
+    PED ==>|"GET ?consumidor&espera<br/>long-polling · reserva"| W1
+    PED ==> W2
+    W1 ==>|"POST id · estado · contenido"| RES
+    W2 ==> RES
+
+    W1 --> L1
+    W2 --> L2
+
+    REDIS[("Redis<br/>estado compartido")]
+    W1 --> REDIS
+    W2 --> REDIS
+
+    subgraph GRPC ["el otro camino, que sigue existiendo"]
+        REP["réplicas gRPC<br/>:8121 · :8122"]
+    end
+    REP --> REDIS
+
+    OPS["Operaciones<br/>validación y orden del contrato §3<br/><b>una sola implementación</b>"]
+    W1 -.-> OPS
+    W2 -.-> OPS
+    REP -.-> OPS
+
+    classDef java fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef cola fill:#8957e5,stroke:#4c2889,color:#fff
+    classDef infra fill:#6e7681,stroke:#30363d,color:#fff
+    classDef log fill:#9e6a03,stroke:#5c3d00,color:#fff
+    classDef compartido fill:#2ea043,stroke:#12511f,color:#fff
+    class W1,W2,REP java
+    class PED,RES,REC,BAL cola
+    class REDIS infra
+    class L1,L2 log
+    class OPS compartido
+```
+
+**Tres cosas que cambian respecto del balanceador de la Etapa 2:**
+
+| | Balanceador (Etapa 2) | Cola (Etapa 4) |
+| :--- | :--- | :--- |
+| Quién elige | El balanceador, por turno | **El worker libre**, pidiendo trabajo |
+| Un worker lento | Recibe igual: le toca por round-robin | Toma menos, porque pide menos |
+| Un worker muerto | Hay que detectarlo con health checks | No hace falta: **le vence la reserva** y otro lo toma |
+
+**El worker no escucha ningún puerto de servicio.** Nadie le habla: es él quien va a buscar
+trabajo. Por eso se despliega en cualquier casa sin pedirle al equipo de red una IP
+alcanzable ni un puerto abierto — sólo necesita *alcanzar* la cola. Lo único que expone es
+un panel de sólo lectura para el `HEALTHCHECK` y para mirarlo en la demo.
+
+**Una sola implementación del contrato.** El worker y las réplicas gRPC resuelven con la
+misma clase `Operaciones`. Si cada uno validara por su cuenta, la misma alta daría
+`INVALID_ARGUMENT` por un camino y `ALREADY_EXISTS` por el otro, y el contrato dejaría de
+valer apenas cambia el transporte.
+
+---
+
+## 9 · Secuencia — el ciclo de una tarea, y los dos casos feos
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Balanceador
+    participant Q as Cola
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant DB as Redis
+
+    Note over W1,W2: los dos están esperando trabajo (long-polling)
+    W1->>Q: GET ?consumidor=w1&espera=20
+    W2->>Q: GET ?consumidor=w2&espera=20
+
+    B->>Q: publicar · POST /personas · id a3f9
+    Q-->>W1: a3f9 · quedaMs 4200 · idempotente false
+    Note over Q: reservado por w1 · 10 s
+
+    W1->>DB: script Lua atómico
+    DB-->>W1: id = 7
+    W1->>W1: bitácora · CrearPersona | OK | id=7 | tarea=a3f9
+    W1->>Q: POST a3f9 · OK · {persona}
+    Q-->>B: respuesta de a3f9
+    B-->>B: se la devuelve al cliente
+
+    rect rgba(218, 54, 51, .12)
+        Note over W2,Q: caso feo 1 — el worker se muere con la tarea en la mano
+        B->>Q: publicar · GET /personas · id b7c1 (idempotente)
+        Q-->>W2: b7c1
+        Note over W2: el worker se cae
+        Note over Q: vence la reserva a los 10 s
+        Q->>Q: idempotente → vuelve AL FRENTE
+        Q-->>W1: b7c1 · intento 1
+        W1->>Q: POST b7c1 · OK
+    end
+
+    rect rgba(210, 153, 34, .15)
+        Note over W1,Q: caso feo 2 — la respuesta que llega segunda
+        Note over W1: w1 tardó más que la reserva, pero contestó igual
+        W1->>Q: POST b7c1 · OK (otra vez)
+        Q-->>W1: 409 · desconocido
+        Note over W1: no se reintenta: gana la primera respuesta
+    end
+```
+
+**Por qué una escritura no se reencola.** Al vencer una reserva, la cola sabe que el worker
+no contestó — pero no sabe si llegó a ejecutar. Repetir una lectura no cuesta nada; repetir
+un alta puede crear la persona dos veces. Por eso lo idempotente vuelve al frente y la
+escritura se falla con `DEADLINE_EXCEEDED`: un error honesto es mejor que un duplicado
+silencioso. Es la misma decisión que el `legajo` único protege del lado de Redis, ahora un
+nivel más arriba.
+
+**Por qué el worker reintenta la respuesta y no la ejecución.** Cuando el POST falla, la
+tarea **ya se ejecutó**: si el alta se escribió en la base y la respuesta se pierde, el
+cliente recibe un error por algo que sí pasó, y como la cola no reintenta las escrituras,
+nadie lo corrige después. Reintentar la ejecución, en cambio, duplicaría el trabajo.
