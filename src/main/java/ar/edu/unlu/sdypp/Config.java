@@ -54,14 +54,43 @@ public final class Config {
      * Worker de la cola. La cola es un servicio de otro equipo, así que TODO lo que
      * depende de su especificación entra por variable de entorno: el día que publiquen una
      * URL distinta, o cambien el nombre de un parámetro, no hay que recompilar nada.
-     *
-     * COLA_CONSUMIDOR identifica a este worker ante la cola. Lleva el HOST_NAME y no la
-     * CASA porque la cola cuenta los pedidos en vuelo por consumidor: dos workers de la
-     * misma casa tienen que poder distinguirse, igual que las réplicas en la bitácora
-     * (CONTRATO.md §5).
      */
-    public static final String COLA_URL = env("TP_COLA_URL", "");
-    public static final String COLA_CONSUMIDOR = env("TP_COLA_CONSUMIDOR", APP + "@" + HOST);
+
+    /**
+     * La <b>seed list</b>: las URLs de los nodos del clúster de colas, separadas por comas.
+     * No es "la URL de la cola" sino "por dónde empezar a buscarla": sólo el master atiende,
+     * el worker lo descubre preguntando y se muda solo cuando cambia.
+     *
+     * <p>Con un solo elemento funciona igual, que es la situación de hoy — por eso
+     * {@code TP_COLA_URL} sigue valiendo como lista de uno y las guías viejas no se rompen.
+     */
+    public static final String COLA_URLS = env("TP_COLA_URLS", env("TP_COLA_URL", ""));
+
+    /**
+     * El token de consumidor, que va en el header {@code X-Cola-Token} de cada request.
+     * Es uno de los tres que maneja la cola (publicador, consumidor, clúster) y habilita
+     * sólo las rutas del worker. Vacío se admite: la cola arrancada sin token no lo exige.
+     */
+    public static final String COLA_TOKEN = env("TP_COLA_TOKEN", "");
+
+    /**
+     * Cómo se identifica este worker ante la cola. <b>Tiene que ser el {@code host:puerto}
+     * gRPC de la réplica</b>, el mismo string que el balanceador usa como {@code destino}
+     * en su pool: es lo que permite cruzar "esta réplica está sana" con "esta réplica
+     * consumió 40 pedidos" sin traducir nada en el medio (contrato del worker, §consumidor).
+     *
+     * <p>Sin default a propósito. El valor que traía antes ({@code java@$HOST_NAME}) es
+     * justamente el error que el contrato nombra: la réplica figura sana y sin consumir
+     * nada, y alguien pierde una tarde buscando por qué. Preferimos no arrancar.
+     */
+    public static final String COLA_CONSUMIDOR = env("TP_COLA_CONSUMIDOR", "");
+
+    /**
+     * El major del contrato de la cola contra el que está escrito este worker. Se compara
+     * con el {@code "contrato"} que devuelve {@code GET /health} al arrancar: si difiere,
+     * el worker falla ruidosamente en vez de operar contra un contrato desconocido.
+     */
+    public static final String COLA_CONTRATO = "1";
     public static final int COLA_HILOS = Integer.parseInt(env("TP_COLA_HILOS", "2"));
     public static final int COLA_ESPERA = Integer.parseInt(env("TP_COLA_ESPERA", "20"));
     public static final int COLA_ADMIN = Integer.parseInt(env("TP_COLA_ADMIN", "9091"));

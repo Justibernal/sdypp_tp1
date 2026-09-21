@@ -196,12 +196,17 @@ Condiciones sin las cuales el balanceador no puede reenviar tráfico.
 
 ---
 
-## 8. La cola de tareas — propuesta v2.3
+## 8. La cola de tareas — v2.4
 
-> **Estado: propuesta.** La cola la implementa otro equipo y su capa HTTP todavía no está
-> publicada. Esto es lo que la App Java ya implementa y contra lo que está probada; lo que
-> haya que ajustar cuando publiquen su especificación se ajusta acá, y sube la versión.
-> Las preguntas abiertas están en [`docs/worker.md`](../docs/worker.md).
+> **Estado: adaptado al contrato publicado.** La cola la implementa otro equipo y su
+> contrato ya está publicado: `docs/contrato-worker.md` del repo del balanceador, rama
+> `feature/desacople` (contrato del worker **v1**). Lo de acá abajo describe ese contrato y
+> es lo que la App Java implementa y contra lo que está probada.
+>
+> Lo que cambió respecto de la v2.3, que era nuestra propuesta a ciegas: las tres operaciones
+> dejaron de ser tres verbos contra una URL y pasaron a ser **tres rutas POST**; apareció el
+> **token**; apareció la **lista de nodos** con descubrimiento del master; y el redirect
+> `421`. Las preguntas que quedan abiertas están en [`docs/worker.md`](../docs/worker.md).
 
 El mismo servicio, por un segundo camino: en vez de atender una conexión gRPC, un **worker**
 toma el pedido de una cola, lo resuelve y devuelve la respuesta. El cliente deja de esperar
@@ -217,20 +222,34 @@ contra una conexión abierta, y el que resuelve deja de necesitar ser alcanzable
 Dos colas y no una bidireccional: en `pedidos` hay N consumidores compitiendo por el mismo
 elemento; en `respuestas` cada elemento tiene **un** destinatario y nadie más lo puede tomar.
 
-### 8.2 · El endpoint del worker
+### 8.2 · Las rutas del worker
 
-Las tres operaciones van contra la **misma URL** (`TP_COLA_URL`), y se distinguen por el
-verbo:
+Tres rutas, las tres **POST con cuerpo JSON**, y las tres contra el **master** del clúster.
+Todas llevan el header `X-Cola-Token` con el token de **consumidor**:
 
-| | Qué hace | Respuesta |
+| Ruta | Cuerpo | Qué hace | Respuesta |
+| :--- | :--- | :--- | :--- |
+| `POST /pedidos/tomar` | `{"consumidor","espera"}` | Toma el próximo pedido y lo **reserva** | `200` con el pedido · `204` si no hubo nada en `espera` |
+| `POST /respuestas` | `{"id","estado","contenido","atendidoPor","app"}` | Devuelve la tarea resuelta | `202` entregada · `409` ver abajo |
+| `POST /pedidos/devolver` | `{"id","consumidor"}` | Suelta un pedido sin resolver (al apagarse) | `200` devuelto · `409` ya no estaba en vuelo |
+| `GET /health` | — (sin token) | Quién es el master y qué versión de contrato habla | `200` |
+
+El `tomar` es de **long-polling**: el worker se queda esperando hasta `espera` segundos
+(techo 30) y lo despiertan apenas hay trabajo. Con polling corto habría cientos de requests
+por minuto sin trabajo, y cada pedido se vería con el retraso del intervalo.
+
+**Sólo el master atiende.** `tomar` no es una lectura: reserva el pedido y lo saca del pool,
+así que no se puede repartir entre nodos — si dos workers tomaran contra dos nodos distintos,
+el mismo pedido se entregaría dos veces. Un nodo que no es el master contesta
+`421 {"error":"no-soy-master","master":"<url>"}`, y el worker actualiza su caché y reintenta
+ahí, sin reiniciar.
+
+**Los dos `409` de `/respuestas` se distinguen por el cuerpo, no por el status:**
+
+| Cuerpo | Significa | Qué hace el worker |
 | :--- | :--- | :--- |
-| `GET ?consumidor=<id>&espera=<s>` | Toma el próximo pedido y lo **reserva** | `200` con el pedido · `204` si no hubo nada en `<s>` |
-| `POST` | Devuelve la tarea resuelta | `2xx` aceptada · `409` la tarea ya no existe |
-| `DELETE ?id=<id>&consumidor=<id>` | Suelta un pedido sin resolver (al apagarse) | `2xx` devuelto · `404` no estaba en vuelo |
-
-El `GET` es de **long-polling**: el worker se queda esperando hasta `espera` segundos y lo
-despiertan apenas hay trabajo. Con polling corto habría cientos de requests por minuto sin
-trabajo, y cada pedido se vería con el retraso del intervalo.
+| `{"resultado":"desconocido"}` | el pedido ya lo contestó otro | descarta, no reintenta |
+| `{"resultado":"destinatario-saturado"}` | el balanceador no recolecta | reintenta con backoff |
 
 ### 8.3 · El sobre
 
@@ -245,7 +264,7 @@ trabajo, y cada pedido se vería con el retraso del intervalo.
 **Respuesta** — lo que el worker devuelve:
 
 ```json
-{"id": "a3f9", "estado": "OK", "atendidoPor": "java@casa-justino-worker-1", "app": "java",
+{"id": "a3f9", "estado": "OK", "atendidoPor": "100.91.134.43:8080", "app": "java",
  "contenido": {"servido_por": "java",
                "persona": {"id": 7, "nombre": "Ada Lovelace", "legajo": 100200}}}
 ```
@@ -254,8 +273,8 @@ trabajo, y cada pedido se vería con el retraso del intervalo.
 | :--- | :--- |
 | `id` | El de la tarea, tal cual vino. Es lo que la cola usa para cerrarla |
 | `estado` | **Nombre del código gRPC**: `OK`, `INVALID_ARGUMENT`, `ALREADY_EXISTS`, `UNAVAILABLE`, `UNIMPLEMENTED`, `DEADLINE_EXCEEDED` |
-| `contenido` | El mensaje del contrato en JSON, **con los nombres de campo del `.proto`** (`servido_por`, no `servidoPor`) |
-| `atendidoPor` | El mismo identificador que el worker manda como `consumidor` |
+| `contenido` | El mensaje del contrato en JSON, **con los nombres de campo del `.proto`** (`servido_por`, no `servidoPor`). ⚠ **Pregunta abierta:** el contrato del otro equipo lo documenta en camelCase (`servidoPor`). El balanceador pasa el `contenido` sin mirarlo, así que hoy no rompe nada, pero es lo que ve el cliente final y conviene cerrarlo antes de la demo |
+| `atendidoPor` | El mismo identificador que el worker manda como `consumidor`: el **`host:puerto` gRPC de la réplica**, que es lo que el balanceador usa como `destino`. No es un nombre libre — si no coincide, la réplica figura sana y sin consumir nada |
 | `app` | `"java"` o `"python"`, como en el resto del contrato |
 
 El `destinatario`, los `intentos` y la espera los completa **la cola** con lo que guardó del

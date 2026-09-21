@@ -24,9 +24,20 @@ REDIS="${REDIS:-sdypp-redis}"
 CASA="${CASA:-casa-justino}"
 TP_REDIS_URL="${TP_REDIS_URL:-redis://$REDIS:6379/0}"
 
-# La URL de la cola es lo único que hay que darle. Mientras el otro equipo no publique la
-# suya, se apunta al doble de prueba (ver docs/worker.md).
-TP_COLA_URL="${TP_COLA_URL:-}"
+# Lo que el contrato pide para hablar con la cola. Son tres cosas y las tres vienen del
+# otro equipo; mientras no publiquen las suyas, se apunta al doble de prueba (docs/worker.md).
+#
+#   TP_COLA_URLS        la seed list: las URLs de los nodos, separadas por comas. Con un
+#                       solo elemento funciona igual, que es la situación de hoy.
+#   TP_COLA_TOKEN       el token de CONSUMIDOR (no el de publicador: ese es del balanceador)
+#   TP_COLA_CONSUMIDOR  el host:puerto gRPC de la réplica, el mismo string que el
+#                       balanceador usa como `destino`. No se inventa: si no coincide, la
+#                       réplica figura sana y sin consumir nada.
+#
+# TP_COLA_URL sigue valiendo como lista de un elemento, para no romper las guías viejas.
+TP_COLA_URLS="${TP_COLA_URLS:-${TP_COLA_URL:-}}"
+TP_COLA_TOKEN="${TP_COLA_TOKEN:-}"
+TP_COLA_CONSUMIDOR="${TP_COLA_CONSUMIDOR:-}"
 
 # Puerto del panel de cada worker en el host: 9101, 9102, ...
 PUERTO_BASE_PANEL=9100
@@ -61,7 +72,9 @@ levantar_uno() {  # <n>
     -p "$puerto:9091" \
     -e HOST_NAME="$CASA-worker-$n" -e CASA="$CASA" \
     -e TP_REDIS_URL="$TP_REDIS_URL" \
-    -e TP_COLA_URL="$TP_COLA_URL" \
+    -e TP_COLA_URLS="$TP_COLA_URLS" \
+    -e TP_COLA_TOKEN="$TP_COLA_TOKEN" \
+    -e TP_COLA_CONSUMIDOR="$TP_COLA_CONSUMIDOR" \
     -v "$PWD/logs/worker-$n:/app/logs" \
     --stop-timeout 15 "$IMAGEN:local" >/dev/null
   log "arriba $nombre · panel en :$puerto"
@@ -83,20 +96,38 @@ esperar_sano() {  # <n>
 
 levantar() {
   local cuantos="${1:-2}" n
-  if [[ -z "$TP_COLA_URL" ]]; then
-    error "falta TP_COLA_URL: es la URL del servicio de cola (GET para tomar, POST para devolver)"
+  if [[ -z "$TP_COLA_URLS" ]]; then
+    error "falta TP_COLA_URLS: las URLs de los nodos de cola, separadas por comas"
+    error "  ej: TP_COLA_URLS=http://cola-1:8085,http://cola-2:8086,http://cola-3:8087"
     error "para probar sin el servicio del otro equipo, ver docs/worker.md (doble de prueba)"
     exit 2
   fi
+  # Todos los workers de esta casa se identifican con el MISMO string, porque el contrato
+  # identifica a la réplica y no al proceso. Dos workers de la misma réplica son dos manos
+  # de la misma réplica, y así es como la cola los cuenta.
+  if [[ -z "$TP_COLA_CONSUMIDOR" ]]; then
+    error "falta TP_COLA_CONSUMIDOR: el host:puerto gRPC de la réplica"
+    error "  es el mismo string que el balanceador usa como \`destino\` en su pool"
+    error "  ej: TP_COLA_CONSUMIDOR=100.91.134.43:8080"
+    exit 2
+  fi
+  if [[ -z "$TP_COLA_TOKEN" ]]; then
+    log "sin TP_COLA_TOKEN: sólo funciona si la cola arrancó sin token"
+  fi
   docker network inspect "$RED" >/dev/null 2>&1 || docker network create "$RED" >/dev/null
-  if ! docker ps --format '{{.Names}}' | grep -qx "$REDIS"; then
+  # Tres casos y no dos: corriendo, parado, y no existe. Sin el caso "parado", el
+  # docker run choca con el nombre ya tomado y el script muere con un error que no
+  # dice nada sobre lo que realmente pasa.
+  if docker ps -a --format '{{.Names}}' | grep -qx "$REDIS"; then
+    docker start "$REDIS" >/dev/null 2>&1 || true
+  else
     log "levantando la base compartida ($REDIS)"
     docker run -d --name "$REDIS" --network "$RED" -p 6379:6379 \
       redis:8-alpine redis-server --appendonly yes >/dev/null
   fi
 
   construir
-  log "cola: $TP_COLA_URL · casa: $CASA · workers: $cuantos"
+  log "cola: $TP_COLA_URLS · como: $TP_COLA_CONSUMIDOR · casa: $CASA · workers: $cuantos"
   for n in $(seq 1 "$cuantos"); do levantar_uno "$n"; done
   for n in $(seq 1 "$cuantos"); do esperar_sano "$n" || exit 1; done
   estado

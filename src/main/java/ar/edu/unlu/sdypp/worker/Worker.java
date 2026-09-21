@@ -72,11 +72,15 @@ public final class Worker {
     private static final AtomicLong RESUELTAS = new AtomicLong();
     private static final AtomicLong FALLIDAS = new AtomicLong();
     private static final AtomicLong DESCARTADAS = new AtomicLong();
+    private static final AtomicLong SATURADAS = new AtomicLong();
     private static final AtomicLong PERDIDAS = new AtomicLong();
     private static final AtomicLong VACIAS = new AtomicLong();
     private static final AtomicLong ERRORES_COLA = new AtomicLong();
     private static final Map<String, AtomicLong> POR_OPERACION = new ConcurrentHashMap<>();
     private static final Map<String, String> EN_VUELO = new ConcurrentHashMap<>();
+
+    /** El cliente, para que el panel —que es estático— pueda mostrar el master vigente. */
+    private static volatile ClienteCola COLA = null;
 
     private static volatile boolean colaSana = true;
     private static volatile String ultimoError = null;
@@ -86,25 +90,50 @@ public final class Worker {
     }
 
     public static void main(String[] args) throws Exception {
-        String url = args.length > 0 ? args[0] : Config.COLA_URL;
-        if (url.isBlank()) {
-            System.out.println("Falta TP_COLA_URL (o pasar la URL como primer argumento).");
-            System.out.println("  ej: TP_COLA_URL=http://localhost:8000/tareas java -cp app-java.jar "
-                    + Worker.class.getName());
+        String urls = args.length > 0 ? args[0] : Config.COLA_URLS;
+        if (urls.isBlank()) {
+            System.out.println("Falta TP_COLA_URLS: las URLs de los nodos de cola, separadas por comas.");
+            System.out.println("  ej: TP_COLA_URLS=http://cola-1:8085,http://cola-2:8086 \\");
+            System.out.println("      TP_COLA_TOKEN=<token> TP_COLA_CONSUMIDOR=10.0.0.7:8080 \\");
+            System.out.println("      java -cp app-java.jar " + Worker.class.getName());
             System.exit(2);
+        }
+
+        // El consumidor no tiene default a propósito. El contrato pide el host:puerto gRPC
+        // de la réplica —el mismo string que el balanceador usa como `destino`— y un default
+        // inventado deja a la réplica figurando sana y sin consumir nada: el sistema anda,
+        // la métrica miente, y nadie lo nota hasta que alguien pierde una tarde buscándolo.
+        // Preferimos no arrancar.
+        if (Config.COLA_CONSUMIDOR.isBlank()) {
+            System.out.println("Falta TP_COLA_CONSUMIDOR: el host:puerto gRPC de la réplica,");
+            System.out.println("  el mismo string que el balanceador usa como `destino` en su pool.");
+            System.out.println("  ej: TP_COLA_CONSUMIDOR=100.91.134.43:8080");
+            System.exit(2);
+        }
+        if (!Config.COLA_CONSUMIDOR.matches("[^\\s:]+:\\d+")) {
+            System.out.println("[cola] OJO: TP_COLA_CONSUMIDOR=" + Config.COLA_CONSUMIDOR
+                    + " no tiene forma host:puerto. El contrato pide el host:puerto gRPC de la"
+                    + " réplica; con otro string la cola no puede cruzar sus contadores con el"
+                    + " /health del balanceador.");
+        }
+        if (Config.COLA_TOKEN.isBlank()) {
+            System.out.println("[cola] sin TP_COLA_TOKEN: sólo funciona si la cola arrancó sin token");
         }
 
         RepositorioPersonas repositorio = RepositorioPersonas.crear();
         Operaciones operaciones = new Operaciones(repositorio);
         Ejecutor ejecutor = new Ejecutor(operaciones);
-        ClienteCola cola = new ClienteCola(url, Config.COLA_CONSUMIDOR);
+        ClienteCola cola = new ClienteCola(urls, Config.COLA_TOKEN, Config.COLA_CONSUMIDOR);
+        COLA = cola;
 
         System.out.printf("Worker de cola (PID: %d) (Arrancado: %s)%n",
                 ProcessHandle.current().pid(), Config.ARRANCADO);
         System.out.printf("[instancia] %s@%s host=%s version=%d hilos=%d%n",
                 Config.APP, Config.CASA, Config.HOST, Config.VERSION, Config.COLA_HILOS);
-        System.out.println("[cola] " + cola.destino() + " como " + Config.COLA_CONSUMIDOR
-                + " (espera " + Config.COLA_ESPERA + "s)");
+        System.out.println("[cola] nodos " + cola.nodos() + " como " + Config.COLA_CONSUMIDOR
+                + " (espera " + Config.COLA_ESPERA + "s, token "
+                + (Config.COLA_TOKEN.isBlank() ? "NO" : "sí") + ")");
+        verificarContrato(cola);
         if (repositorio == null) {
             System.out.println("[personas] sin TP_REDIS_URL: las tareas de personas se responden UNAVAILABLE");
         } else {
@@ -150,6 +179,44 @@ public final class Worker {
         for (Thread hilo : consumidores) {
             hilo.join();
         }
+    }
+
+    /**
+     * Compara el major del contrato que declara la cola con el que este worker sabe hablar.
+     *
+     * <p>Difiere: se sale. Operar contra un contrato desconocido es peor que no arrancar —
+     * un campo que cambió de significado no se nota en el momento, se nota en los datos.
+     *
+     * <p>No contesta nadie: se sigue igual, con un aviso. La cola puede estar levantándose
+     * después que el worker, y para eso está el backoff; hacer fallar el arranque por eso
+     * convertiría un orden de encendido en un error de despliegue.
+     */
+    private static void verificarContrato(ClienteCola cola) {
+        JsonObject salud = cola.salud();
+        if (salud == null) {
+            System.out.println("[cola] ningún nodo contestó /health al arrancar: "
+                    + "se sigue igual y se reintenta con backoff");
+            return;
+        }
+        String declarado = salud.has("contrato") && !salud.get("contrato").isJsonNull()
+                ? salud.get("contrato").getAsString() : null;
+        if (declarado == null) {
+            System.out.println("[cola] el nodo no declara versión de contrato en /health; "
+                    + "se asume v" + Config.COLA_CONTRATO);
+            return;
+        }
+        String major = declarado.split("\\.")[0];
+        if (!major.equals(Config.COLA_CONTRATO)) {
+            System.out.println("[cola] contrato incompatible: la cola habla v" + declarado
+                    + " y este worker está escrito contra v" + Config.COLA_CONTRATO + ".x");
+            System.out.println("  Un major distinto significa que algún campo cambió de "
+                    + "significado. No se arranca.");
+            System.exit(3);
+        }
+        System.out.println("[cola] contrato v" + declarado + " · rol="
+                + (salud.has("rol") ? salud.get("rol").getAsString() : "?")
+                + " · master=" + (salud.has("masterConocido") && !salud.get("masterConocido").isJsonNull()
+                        ? salud.get("masterConocido").getAsString() : "(sin resolver)"));
     }
 
     /** El ciclo de un consumidor: tomar, resolver, responder. */
@@ -256,6 +323,26 @@ public final class Worker {
                 if (entrega == ClienteCola.Entrega.DESCARTADA) {
                     DESCARTADAS.incrementAndGet();
                     System.out.println("[cola] la " + tarea + " ya no existía: otra réplica llegó primero");
+                    return;
+                }
+                // Saturado NO es lo mismo que descartado: el pedido sigue existiendo y su
+                // destinatario puede volver. Se reintenta con la misma pausa creciente que
+                // el resto de las fallas de entrega, y recién ahí se da por perdida.
+                if (entrega == ClienteCola.Entrega.SATURADA) {
+                    SATURADAS.incrementAndGet();
+                    if (intento == REINTENTOS_RESPUESTA) {
+                        PERDIDAS.incrementAndGet();
+                        System.out.println("[cola] el destinatario de la " + tarea
+                                + " sigue saturado después de " + intento + " intentos");
+                        return;
+                    }
+                    ultimoError = "destinatario saturado al entregar la " + tarea;
+                    if (!dormir(espera)) {
+                        PERDIDAS.incrementAndGet();
+                        return;
+                    }
+                    espera *= 2;
+                    continue;
                 }
                 return;
             } catch (ClienteCola.ColaNoDisponible e) {
@@ -266,15 +353,23 @@ public final class Worker {
                             + " (" + intento + " intentos): " + e.getMessage());
                     return;
                 }
-                try {
-                    Thread.sleep(espera);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
+                if (!dormir(espera)) {
                     PERDIDAS.incrementAndGet();
                     return;
                 }
                 espera *= 2;
             }
+        }
+    }
+
+    /** Duerme entre reintentos. false si interrumpieron: el que llama abandona la entrega. */
+    private static boolean dormir(long ms) {
+        try {
+            Thread.sleep(ms);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 
@@ -321,10 +416,14 @@ public final class Worker {
         o.addProperty("hilos", Config.COLA_HILOS);
         o.addProperty("arrancado", Config.ARRANCADO);
         o.addProperty("colaSana", colaSana);
+        // Cuál de los nodos de la seed list está atendiendo ahora. Es lo primero que se
+        // mira cuando el clúster cambió de master y hay que saber si el worker se mudó.
+        o.addProperty("master", COLA == null ? null : COLA.master());
         o.addProperty("tomadas", TOMADAS.get());
         o.addProperty("resueltas", RESUELTAS.get());
         o.addProperty("fallidas", FALLIDAS.get());
         o.addProperty("descartadas", DESCARTADAS.get());
+        o.addProperty("saturadas", SATURADAS.get());
         o.addProperty("perdidas", PERDIDAS.get());
         o.addProperty("esperasVacias", VACIAS.get());
         o.addProperty("erroresDeCola", ERRORES_COLA.get());

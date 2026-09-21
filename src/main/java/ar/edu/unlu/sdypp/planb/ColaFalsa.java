@@ -42,14 +42,22 @@ import java.util.concurrent.TimeUnit;
  * se falla con {@code DEADLINE_EXCEEDED}, porque "no contestó" no dice si alcanzó a
  * ejecutarse.
  *
+ * <p><b>Habla el contrato real</b> (contrato del worker v1): las mismas rutas, los mismos
+ * códigos y los mismos cuerpos que el servicio del otro equipo. Si hablara otra cosa no
+ * serviría para lo único que tiene que servir — probar que el worker cumple el contrato —,
+ * y la prueba pasaría en verde mientras el worker no anda contra la cola de verdad.
+ *
  * <pre>
- *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8000 /tareas
+ *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8000
  *
- *   # publicar tareas, como haría el balanceador
- *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa publicar http://localhost:8000/tareas 20
+ *   # publicar tareas y recolectar, como haría el balanceador
+ *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa publicar http://localhost:8000 20
  *
- *   curl -s localhost:8000/estado
- *   curl -s "localhost:8000/tareas/respuestas?destinatario=balanceador@casa-justino&espera=5"
+ *   curl -s localhost:8000/health
+ *   curl -s -H "X-Cola-Token: $COLA_TOKEN" localhost:8000/estado
+ *
+ *   # un nodo que NO es master, para probar que el worker sigue el 421:
+ *   COLA_FALSA_MASTER=http://localhost:8000 java -cp target/app-java.jar  *       ar.edu.unlu.sdypp.planb.ColaFalsa 8001
  * </pre>
  */
 public final class ColaFalsa {
@@ -59,6 +67,34 @@ public final class ColaFalsa {
 
     /** Presupuesto de un pedido recién publicado, si el publicador no dice otro. */
     private static final long PRESUPUESTO_MS = 30_000;
+
+    /** Versión del contrato que declara este doble. Tiene que ser la del servicio real. */
+    private static final String CONTRATO = "1.0";
+
+    /**
+     * Respuestas sin recolectar por destinatario antes de contestar
+     * {@code 409 destinatario-saturado}. Existe para poder provocar ese caso a voluntad:
+     * con el servicio real hay que tirar abajo un balanceador para verlo.
+     */
+    private static final int COTA_RESPUESTAS =
+            Integer.parseInt(System.getenv().getOrDefault("COLA_FALSA_COTA_RESPUESTAS", "1000"));
+
+    /**
+     * Los mismos tres tokens que maneja el servicio real, para que el worker que manda el
+     * token equivocado se coma el 403 acá y no en la demo. Vacío = no se exige.
+     */
+    private static final String TOKEN = System.getenv().getOrDefault("COLA_TOKEN", "");
+    private static final String TOKEN_PUBLICADOR =
+            System.getenv().getOrDefault("COLA_TOKEN_PUBLICADOR", TOKEN);
+    private static final String TOKEN_CONSUMIDOR =
+            System.getenv().getOrDefault("COLA_TOKEN_CONSUMIDOR", TOKEN);
+
+    /**
+     * Si está seteada, este nodo se comporta como <b>slave</b>: contesta 421 en todas las
+     * rutas de datos apuntando a esa URL. Es lo que permite probar el redirect del worker
+     * sin levantar el clúster entero.
+     */
+    private static final String MASTER_AJENO = System.getenv().getOrDefault("COLA_FALSA_MASTER", "");
 
     private static final class Pedido {
         final String id = UUID.randomUUID().toString().substring(0, 8);
@@ -110,7 +146,6 @@ public final class ColaFalsa {
         }
 
         int puerto = args.length > 0 ? Integer.parseInt(args[0]) : 8000;
-        String ruta = args.length > 1 ? args[1] : "/tareas";
 
         HttpServer servidor = HttpServer.create(new InetSocketAddress(puerto), 0);
         // Pool y no el executor por defecto (que atiende de a uno): los GET del worker son
@@ -119,10 +154,14 @@ public final class ColaFalsa {
         // cola se trabaría sola.
         servidor.setExecutor(Executors.newFixedThreadPool(16));
 
-        servidor.createContext(ruta + "/publicar", ColaFalsa::publicarHandler);
-        servidor.createContext(ruta + "/respuestas", ColaFalsa::respuestasHandler);
-        servidor.createContext(ruta, ColaFalsa::tareasHandler);
-        servidor.createContext("/estado", intercambio -> responder(intercambio, 200, estado()));
+        // Las rutas son las del contrato y no una invencion nuestra: es lo unico que hace
+        // que probar contra este doble signifique algo. HttpServer resuelve por prefijo mas
+        // largo, asi que "/pedidos" atiende tambien "/pedidos/tomar" y el despacho fino se
+        // hace adentro, por ruta exacta.
+        servidor.createContext("/pedidos", ColaFalsa::pedidosHandler);
+        servidor.createContext("/respuestas", ColaFalsa::respuestasHandler);
+        servidor.createContext("/health", ColaFalsa::saludHandler);
+        servidor.createContext("/estado", ColaFalsa::estadoHandler);
         servidor.start();
 
         // El recuperador: sin esto, el pedido de un worker que se murió se queda en vuelo
@@ -133,38 +172,174 @@ public final class ColaFalsa {
             return t;
         }).scheduleWithFixedDelay(ColaFalsa::recuperar, 1, 1, TimeUnit.SECONDS);
 
-        System.out.println("Cola (PLAN B — doble de prueba) en 0.0.0.0:" + puerto + ruta);
-        System.out.println("  GET    " + ruta + "?consumidor=<id>&espera=<s>   tomar un pedido");
-        System.out.println("  POST   " + ruta + "                              devolver la respuesta");
-        System.out.println("  DELETE " + ruta + "?id=<id>&consumidor=<id>      soltar un pedido");
-        System.out.println("  POST   " + ruta + "/publicar                     publicar (rol balanceador)");
-        System.out.println("  GET    " + ruta + "/respuestas?destinatario=<d>  recolectar (rol balanceador)");
-        System.out.println("  GET    /estado");
+        System.out.println("Cola (PLAN B — doble de prueba) en 0.0.0.0:" + puerto
+                + " · contrato v" + CONTRATO
+                + " · token " + (TOKEN_CONSUMIDOR.isEmpty() ? "NO" : "si")
+                + (MASTER_AJENO.isEmpty() ? " · rol master" : " · rol slave -> " + MASTER_AJENO));
+        System.out.println("  POST /pedidos/tomar      {consumidor,espera}    worker: tomar");
+        System.out.println("  POST /respuestas         {id,estado,...}        worker: responder");
+        System.out.println("  POST /pedidos/devolver   {id,consumidor}        worker: soltar");
+        System.out.println("  POST /pedidos            {operacion,...}        balanceador: publicar");
+        System.out.println("  POST /respuestas/tomar   {destinatario,espera}  balanceador: recolectar");
+        System.out.println("  GET  /health · GET /estado");
     }
 
-    // --- el endpoint del worker --------------------------------------------------------
+    // --- despacho ----------------------------------------------------------------------
 
-    private static void tareasHandler(HttpExchange intercambio) throws IOException {
-        switch (intercambio.getRequestMethod()) {
-            case "GET":
-                tomar(intercambio);
+    /**
+     * Las tres rutas de pedidos. El cuerpo se lee SIEMPRE y antes que nada —aunque la ruta
+     * no exista o el token este mal— por la misma razon que en el servicio real: con
+     * keep-alive, los bytes que no se leen quedan en el buffer del socket y el servidor los
+     * toma como la linea de pedido de la request siguiente. La conexion queda envenenada y
+     * el proximo pedido muere con un 400 que no tiene nada que ver con lo que mando.
+     */
+    private static void pedidosHandler(HttpExchange intercambio) throws IOException {
+        if (!"POST".equals(intercambio.getRequestMethod())) {
+            responder(intercambio, 405, "{\"error\":\"metodo no permitido\"}");
+            return;
+        }
+        JsonObject cuerpo = cuerpoJson(intercambio);
+        if (redirigir(intercambio)) {
+            return;
+        }
+        switch (ruta(intercambio)) {
+            case "/pedidos":
+                if (autorizado(intercambio, TOKEN_PUBLICADOR)) {
+                    publicarPedido(intercambio, cuerpo);
+                }
                 return;
-            case "POST":
-                recibirRespuesta(intercambio);
+            case "/pedidos/tomar":
+                if (autorizado(intercambio, TOKEN_CONSUMIDOR)) {
+                    tomar(intercambio, cuerpo);
+                }
                 return;
-            case "DELETE":
-                soltar(intercambio);
+            case "/pedidos/devolver":
+                if (autorizado(intercambio, TOKEN_CONSUMIDOR)) {
+                    soltar(intercambio, cuerpo);
+                }
                 return;
             default:
-                responder(intercambio, 405, "{\"error\":\"método no permitido\"}");
+                responder(intercambio, 404, "{\"error\":\"no existe\"}");
         }
     }
 
-    /** GET: entrega el próximo pedido y lo reserva. 204 si no hubo nada en `espera`. */
-    private static void tomar(HttpExchange intercambio) throws IOException {
-        Map<String, String> parametros = consulta(intercambio);
-        String consumidor = parametros.getOrDefault("consumidor", "anónimo");
-        long limite = ahora() + entero(parametros.get("espera"), 20) * 1000;
+    /** Las dos rutas de respuestas: la del worker (publicar) y la del balanceador (tomar). */
+    private static void respuestasHandler(HttpExchange intercambio) throws IOException {
+        if (!"POST".equals(intercambio.getRequestMethod())) {
+            responder(intercambio, 405, "{\"error\":\"metodo no permitido\"}");
+            return;
+        }
+        JsonObject cuerpo = cuerpoJson(intercambio);
+        if (redirigir(intercambio)) {
+            return;
+        }
+        switch (ruta(intercambio)) {
+            case "/respuestas":
+                if (autorizado(intercambio, TOKEN_CONSUMIDOR)) {
+                    recibirRespuesta(intercambio, cuerpo);
+                }
+                return;
+            case "/respuestas/tomar":
+                if (autorizado(intercambio, TOKEN_PUBLICADOR)) {
+                    entregarRespuesta(intercambio, cuerpo);
+                }
+                return;
+            default:
+                responder(intercambio, 404, "{\"error\":\"no existe\"}");
+        }
+    }
+
+    /**
+     * El {@code /health} del contrato, sin token: es lo que usan el worker y el balanceador
+     * para descubrir quien es el master, y exigirles un token para preguntarlo seria pedir
+     * la llave para averiguar donde esta la puerta.
+     */
+    private static void saludHandler(HttpExchange intercambio) throws IOException {
+        JsonObject o = new JsonObject();
+        o.addProperty("cola", "sana");
+        o.addProperty("rol", MASTER_AJENO.isEmpty() ? "master" : "slave");
+        o.addProperty("termino", 1);
+        o.addProperty("masterConocido", MASTER_AJENO.isEmpty() ? miUrl(intercambio) : MASTER_AJENO);
+        o.addProperty("contrato", CONTRATO);
+        o.addProperty("instancia", "cola-falsa");
+        synchronized (CANDADO) {
+            o.addProperty("esperando", ESPERANDO.size());
+            o.addProperty("enVuelo", EN_VUELO.size());
+        }
+        o.addProperty("cota", COTA_RESPUESTAS);
+        responder(intercambio, 200, o.toString());
+    }
+
+    private static void estadoHandler(HttpExchange intercambio) throws IOException {
+        if (autorizado(intercambio, TOKEN_PUBLICADOR)) {
+            responder(intercambio, 200, estado());
+        }
+    }
+
+    /** La ruta pedida, sin query y sin barra final. */
+    private static String ruta(HttpExchange intercambio) {
+        String ruta = intercambio.getRequestURI().getPath();
+        while (ruta.length() > 1 && ruta.endsWith("/")) {
+            ruta = ruta.substring(0, ruta.length() - 1);
+        }
+        return ruta;
+    }
+
+    /** 403 y false si el token no coincide. Vacio = no se exige. */
+    private static boolean autorizado(HttpExchange intercambio, String esperado) throws IOException {
+        if (esperado.isEmpty()
+                || esperado.equals(intercambio.getRequestHeaders().getFirst("X-Cola-Token"))) {
+            return true;
+        }
+        responder(intercambio, 403, "{\"error\":\"token invalido\"}");
+        return false;
+    }
+
+    /**
+     * 421 y true si este nodo esta haciendo de slave. Es el caso que el worker tiene que
+     * saber seguir: actualizar su cache con la URL de adentro y reintentar ahi.
+     */
+    private static boolean redirigir(HttpExchange intercambio) throws IOException {
+        if (MASTER_AJENO.isEmpty()) {
+            return false;
+        }
+        responder(intercambio, 421,
+                "{\"error\":\"no-soy-master\",\"master\":\"" + MASTER_AJENO + "\"}");
+        return true;
+    }
+
+    /**
+     * La URL por la que el cliente llego hasta aca, sacada del header Host.
+     *
+     * <p>No se arma con getLocalAddress(): sobre IPv6 eso devuelve la direccion cruda y sale
+     * un "http://0:0:0:0:0:0:0:1:8000" que no es una URL valida. El Host es lo que el
+     * cliente escribio, que es justo lo que tiene que poder volver a usar.
+     */
+    private static String miUrl(HttpExchange intercambio) {
+        String host = intercambio.getRequestHeaders().getFirst("Host");
+        if (host == null || host.isBlank()) {
+            host = "localhost:" + intercambio.getLocalAddress().getPort();
+        }
+        return "http://" + host;
+    }
+
+    // --- las rutas del worker ----------------------------------------------------------
+
+    /**
+     * {@code POST /pedidos/tomar}: entrega el proximo pedido y lo reserva. 204 si no hubo
+     * nada en {@code espera} segundos.
+     *
+     * <p>El {@code consumidor} es obligatorio y sin default: el servicio real contesta 400
+     * sin el, y un default silencioso acá haria pasar una prueba que contra la cola de
+     * verdad falla.
+     */
+    private static void tomar(HttpExchange intercambio, JsonObject cuerpoPedido) throws IOException {
+        if (cuerpoPedido == null || texto(cuerpoPedido, "consumidor", null) == null) {
+            responder(intercambio, 400, "{\"error\":\"falta consumidor\"}");
+            return;
+        }
+        String consumidor = texto(cuerpoPedido, "consumidor", null);
+        long limite = ahora() + Math.min(enteroJson(cuerpoPedido, "espera", 20), 30) * 1000;
 
         // Se arma la respuesta adentro del candado y se escribe afuera: un cliente lento
         // escribiendo su respuesta no tiene por qué frenar al que viene a publicar.
@@ -200,9 +375,14 @@ public final class ColaFalsa {
         }
     }
 
-    /** POST: el worker contestó. 409 si ese pedido ya no existe (llegó segundo). */
-    private static void recibirRespuesta(HttpExchange intercambio) throws IOException {
-        JsonObject cuerpo = cuerpoJson(intercambio);
+    /**
+     * {@code POST /respuestas}: el worker contesto.
+     *
+     * <p>Los dos 409 del contrato salen de aca y se distinguen por el cuerpo:
+     * {@code desconocido} (el pedido ya lo contesto otro: hay que tirarla) y
+     * {@code destinatario-saturado} (el balanceador no recolecta: se puede reintentar).
+     */
+    private static void recibirRespuesta(HttpExchange intercambio, JsonObject cuerpo) throws IOException {
         if (cuerpo == null || !cuerpo.has("id")) {
             responder(intercambio, 400, "{\"error\":\"falta el id\"}");
             return;
@@ -213,7 +393,17 @@ public final class ColaFalsa {
             Pedido pedido = completar(id);
             if (pedido == null) {
                 descartados++;
-                responder(intercambio, 409, "{\"error\":\"desconocido\"}");
+                responder(intercambio, 409, "{\"resultado\":\"desconocido\"}");
+                return;
+            }
+            // Saturado: el destinatario hace rato que no recolecta. Se chequea ANTES de
+            // contar la respuesta como entregada, porque el pedido vuelve a quedar sin
+            // contestar y el worker tiene que poder reintentar.
+            Deque<JsonObject> pendientes = RESPUESTAS.computeIfAbsent(
+                    pedido.destinatario, k -> new ArrayDeque<>());
+            if (pendientes.size() >= COTA_RESPUESTAS) {
+                EN_VUELO.put(pedido.id, pedido);
+                responder(intercambio, 409, "{\"resultado\":\"destinatario-saturado\"}");
                 return;
             }
             respondidos++;
@@ -223,20 +413,25 @@ public final class ColaFalsa {
                             ? cuerpo.getAsJsonObject("contenido") : new JsonObject(),
                     texto(cuerpo, "atendidoPor", null),
                     texto(cuerpo, "app", null));
-            RESPUESTAS.computeIfAbsent(pedido.destinatario, k -> new ArrayDeque<>()).add(respuesta);
+            pendientes.add(respuesta);
             CANDADO.notifyAll();
         }
-        responder(intercambio, 200, "{\"entregada\":true}");
+        responder(intercambio, 202, "{\"resultado\":\"entregada\"}");
     }
 
-    /** DELETE: el worker suelta un pedido sin resolver. Vuelve al frente: ya esperó una vez. */
-    private static void soltar(HttpExchange intercambio) throws IOException {
-        Map<String, String> parametros = consulta(intercambio);
-        String id = parametros.get("id");
+    /**
+     * {@code POST /pedidos/devolver}: el worker suelta un pedido sin resolver. Vuelve al
+     * frente, no al final: ya espero una vez.
+     *
+     * <p>409 y no 404 cuando no estaba en vuelo, como el servicio real: no es "esa ruta no
+     * existe", es "llegaste tarde, la reserva ya vencio y el recuperador se te adelanto".
+     */
+    private static void soltar(HttpExchange intercambio, JsonObject cuerpo) throws IOException {
+        String id = cuerpo == null ? null : texto(cuerpo, "id", null);
         synchronized (CANDADO) {
             Pedido pedido = id == null ? null : EN_VUELO.remove(id);
             if (pedido == null) {
-                responder(intercambio, 404, "{\"error\":\"no estaba en vuelo\"}");
+                responder(intercambio, 409, "{\"resultado\":\"no-estaba-en-vuelo\"}");
                 return;
             }
             pedido.reservadoPor = null;
@@ -244,17 +439,13 @@ public final class ColaFalsa {
             ESPERANDO.addFirst(pedido);
             CANDADO.notifyAll();
         }
-        responder(intercambio, 200, "{\"devuelto\":true}");
+        responder(intercambio, 200, "{\"resultado\":\"devuelto\"}");
     }
 
     // --- los endpoints del rol balanceador ---------------------------------------------
 
-    private static void publicarHandler(HttpExchange intercambio) throws IOException {
-        if (!intercambio.getRequestMethod().equals("POST")) {
-            responder(intercambio, 405, "{\"error\":\"método no permitido\"}");
-            return;
-        }
-        JsonObject cuerpo = cuerpoJson(intercambio);
+    /** {@code POST /pedidos}: lo llama el balanceador. 202 con el id asignado. */
+    private static void publicarPedido(HttpExchange intercambio, JsonObject cuerpo) throws IOException {
         if (cuerpo == null) {
             responder(intercambio, 400, "{\"error\":\"cuerpo ilegible\"}");
             return;
@@ -279,13 +470,19 @@ public final class ColaFalsa {
             publicados++;
             CANDADO.notifyAll();
         }
-        responder(intercambio, 202, "{\"id\":\"" + pedido.id + "\"}");
+        responder(intercambio, 202, "{\"id\":\"" + pedido.id + "\",\"encolado\":true}");
     }
 
-    private static void respuestasHandler(HttpExchange intercambio) throws IOException {
-        Map<String, String> parametros = consulta(intercambio);
-        String destinatario = parametros.getOrDefault("destinatario", "balanceador@local");
-        long limite = ahora() + entero(parametros.get("espera"), 5) * 1000;
+    /**
+     * {@code POST /respuestas/tomar}: lo llama el recolector del balanceador. Cada respuesta
+     * tiene UN destinatario y nadie mas se la puede llevar — con una FIFO sola, el segundo
+     * balanceador se comeria las respuestas del primero.
+     */
+    private static void entregarRespuesta(HttpExchange intercambio, JsonObject cuerpoPedido) throws IOException {
+        String destinatario = cuerpoPedido == null ? "balanceador@local"
+                : texto(cuerpoPedido, "destinatario", "balanceador@local");
+        long limite = ahora() + Math.min(
+                cuerpoPedido == null ? 5 : enteroJson(cuerpoPedido, "espera", 5), 30) * 1000;
 
         String cuerpo = null;
         synchronized (CANDADO) {
@@ -363,7 +560,7 @@ public final class ColaFalsa {
     // --- el modo cliente: publicar tareas como lo haría el balanceador -----------------
 
     private static void publicar(String[] args) throws Exception {
-        String url = args.length > 1 ? args[1] : "http://localhost:8000/tareas";
+        String url = args.length > 1 ? args[1] : "http://localhost:8000";
         int cuantas = args.length > 2 ? Integer.parseInt(args[2]) : 10;
         String destinatario = args.length > 3 ? args[3] : "balanceador@local";
         long base = System.currentTimeMillis() % 100000;
@@ -399,9 +596,10 @@ public final class ColaFalsa {
             sobre.addProperty("destinatario", destinatario);
 
             HttpResponse<String> respuesta = http.send(HttpRequest.newBuilder()
-                            .uri(URI.create(url + "/publicar"))
+                            .uri(URI.create(url + "/pedidos"))
                             .timeout(Duration.ofSeconds(5))
                             .header("Content-Type", "application/json; charset=utf-8")
+                            .header("X-Cola-Token", TOKEN_PUBLICADOR)
                             .POST(HttpRequest.BodyPublishers.ofString(sobre.toString(), StandardCharsets.UTF_8))
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
@@ -419,11 +617,16 @@ public final class ColaFalsa {
         Map<String, Integer> porEstado = new HashMap<>();
         Map<String, Integer> porWorker = new HashMap<>();
         while (recolectadas < publicadas) {
+            JsonObject pedido = new JsonObject();
+            pedido.addProperty("destinatario", destinatario);
+            pedido.addProperty("espera", 10);
             HttpResponse<String> respuesta = http.send(HttpRequest.newBuilder()
-                            .uri(URI.create(url + "/respuestas?destinatario="
-                                    + java.net.URLEncoder.encode(destinatario, StandardCharsets.UTF_8) + "&espera=10"))
+                            .uri(URI.create(url + "/respuestas/tomar"))
                             .timeout(Duration.ofSeconds(15))
-                            .GET().build(),
+                            .header("Content-Type", "application/json; charset=utf-8")
+                            .header("X-Cola-Token", TOKEN_PUBLICADOR)
+                            .POST(HttpRequest.BodyPublishers.ofString(pedido.toString(), StandardCharsets.UTF_8))
+                            .build(),
                     HttpResponse.BodyHandlers.ofString());
             if (respuesta.statusCode() != 200) {
                 break;
@@ -450,6 +653,19 @@ public final class ColaFalsa {
         try {
             return valor == null ? porDefecto : Long.parseLong(valor.trim());
         } catch (NumberFormatException e) {
+            return porDefecto;
+        }
+    }
+
+    /** Un numero del cuerpo JSON. Si llega como string o roto, vale el default. */
+    private static long enteroJson(JsonObject cuerpo, String clave, long porDefecto) {
+        JsonElement e = cuerpo == null ? null : cuerpo.get(clave);
+        if (e == null || !e.isJsonPrimitive()) {
+            return porDefecto;
+        }
+        try {
+            return e.getAsLong();
+        } catch (RuntimeException ex) {
             return porDefecto;
         }
     }

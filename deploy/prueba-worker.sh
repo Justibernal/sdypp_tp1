@@ -19,6 +19,7 @@ RED="${RED:-sdypp}"
 REDIS="${REDIS:-sdypp-redis}"
 CASA="${CASA:-casa-justino}"
 PUERTO_COLA="${PUERTO_COLA:-8000}"
+PUERTO_SLAVE="${PUERTO_SLAVE:-8010}"
 DEST="balanceador@prueba"
 LEGAJO=$((700000 + RANDOM % 90000))
 
@@ -27,12 +28,16 @@ ok()   { printf '\033[1;32m[  ok  ]\033[0m %s\n' "$*"; }
 mal()  { printf '\033[1;31m[ FALLA]\033[0m %s\n' "$*"; FALLAS=$((FALLAS+1)); }
 FALLAS=0
 
+# Las dos rutas del rol balanceador, tal como las fija el contrato: se publica por
+# POST /pedidos y se recolecta por POST /respuestas/tomar, con el destinatario en el cuerpo.
 publicar() {
-  curl -s -X POST "http://localhost:$PUERTO_COLA/tareas/publicar" \
+  curl -s -X POST "http://localhost:$PUERTO_COLA/pedidos" \
     -H 'Content-Type: application/json' -d "$1" > /dev/null
 }
-respuesta() {
-  curl -s "http://localhost:$PUERTO_COLA/tareas/respuestas?destinatario=balanceador%40prueba&espera=20"
+respuesta() {  # [espera en segundos]
+  curl -s -X POST "http://localhost:$PUERTO_COLA/respuestas/tomar" \
+    -H 'Content-Type: application/json' \
+    -d "{\"destinatario\":\"$DEST\",\"espera\":${1:-20}}"
 }
 # Comprueba que la respuesta traiga lo esperado, y la muestra.
 esperar() {  # <que se espera> <patron> <respuesta>
@@ -54,23 +59,30 @@ mkdir -p logs
 
 # --- 0. base compartida -------------------------------------------------------
 docker network inspect "$RED" > /dev/null 2>&1 || docker network create "$RED" > /dev/null
-docker ps --format '{{.Names}}' | grep -qx "$REDIS" || \
+docker ps -a --format '{{.Names}}' | grep -qx "$REDIS" && docker start "$REDIS" > /dev/null 2>&1 || \
   docker run -d --name "$REDIS" --network "$RED" -p 6379:6379 \
     redis:8-alpine redis-server --appendonly yes > /dev/null
 log "redis: $(docker inspect --format '{{.State.Status}}' "$REDIS")"
 
 # --- 1. la cola ---------------------------------------------------------------
-if [ -z "${TP_COLA_URL:-}" ]; then
-  log "sin TP_COLA_URL: se levanta el doble de prueba en :$PUERTO_COLA"
-  MSYS_NO_PATHCONV=1 java -cp "$JAR" ar.edu.unlu.sdypp.planb.ColaFalsa "$PUERTO_COLA" /tareas \
+if [ -z "${TP_COLA_URLS:-}" ]; then
+  log "sin TP_COLA_URLS: se levanta el doble de prueba en :$PUERTO_COLA"
+  java -cp "$JAR" ar.edu.unlu.sdypp.planb.ColaFalsa "$PUERTO_COLA" \
     > logs/cola-falsa.log 2>&1 &
+  # Y un segundo nodo que NO es master: contesta 421 apuntando al primero. Es lo que prueba
+  # que el worker sigue el redirect en vez de tratarlo como una caída de la cola.
+  COLA_FALSA_MASTER="http://host.docker.internal:$PUERTO_COLA" \
+    java -cp "$JAR" ar.edu.unlu.sdypp.planb.ColaFalsa "$PUERTO_SLAVE" \
+    > logs/cola-falsa-slave.log 2>&1 &
   sleep 3
-  curl -s "localhost:$PUERTO_COLA/estado" > /dev/null || { mal "la cola no arrancó"; exit 1; }
-  ok "cola de prueba arriba"
-  # El worker corre en un contenedor: para él, el host es host.docker.internal
-  export TP_COLA_URL="http://host.docker.internal:$PUERTO_COLA/tareas"
+  curl -s "localhost:$PUERTO_COLA/health" > /dev/null || { mal "la cola no arrancó"; exit 1; }
+  curl -s "localhost:$PUERTO_SLAVE/health" > /dev/null || { mal "el nodo slave no arrancó"; exit 1; }
+  ok "cola de prueba arriba (master en :$PUERTO_COLA, slave en :$PUERTO_SLAVE)"
+  # El worker corre en un contenedor: para él, el host es host.docker.internal. La seed list
+  # arranca por el SLAVE a propósito, para que el arranque real ejercite el descubrimiento.
+  export TP_COLA_URLS="http://host.docker.internal:$PUERTO_SLAVE,http://host.docker.internal:$PUERTO_COLA"
 else
-  log "usando la cola real: $TP_COLA_URL"
+  log "usando la cola real: $TP_COLA_URLS"
 fi
 
 # --- 2. una réplica gRPC, para probar el cruce entre los dos caminos ----------
@@ -89,6 +101,9 @@ PUERTO_GRPC=$(docker ps --format '{{.Names}} {{.Ports}}' | grep 'sdypp-java-' | 
 log "réplica gRPC en :$PUERTO_GRPC"
 
 # --- 3. los workers -----------------------------------------------------------
+# El consumidor es el host:puerto gRPC de la réplica, como pide el contrato: acá, la réplica
+# de prueba que se levantó recién.
+export TP_COLA_CONSUMIDOR="${TP_COLA_CONSUMIDOR:-host.docker.internal:$PUERTO_GRPC}"
 export CASA
 sh deploy/worker.sh levantar 2 || { mal "no se pudieron levantar los workers"; exit 1; }
 
@@ -138,7 +153,7 @@ INICIO=$(date +%s)
 # de la cola, y cada uno se traga la tarea una reserva entera antes de devolverla. Con 2
 # hilos y 10 s de reserva, la primera tarea después de un apagado puede tardar 20 s. No es
 # una falla: es el consumidor fantasma, explicado en docs/worker.md.
-R=$(curl -s "http://localhost:$PUERTO_COLA/tareas/respuestas?destinatario=balanceador%40prueba&espera=90")
+R=$(respuesta 90)
 TARDO=$(( $(date +%s) - INICIO ))
 esperar "la tarea se resolvió igual (tardó ${TARDO}s)" '"estado":"OK"' "$R"
 if [ "$TARDO" -gt 5 ]; then
