@@ -23,7 +23,13 @@ compilación baja las dependencias y puede tardar un par de minutos; las siguien
 segundos.
 
 > **El proyecto no va dentro de la carpeta de la materia.** Esa ruta tiene un emoji (`📚`) y
-> `java -jar` falla desde ahí. Siempre en `~/sdypp_servJava`.
+> `java -jar` falla desde ahí. Siempre en `~/sdypp_servJava`. Lo mismo vale para las tildes
+> y la `ñ`: con una en el camino, `protoc` falla al compilar y el error no dice por qué.
+
+> **Esta guía es del servicio gRPC.** Para levantar un **worker de cola**, que es el otro
+> camino al mismo servicio, el paso a paso está en
+> [`levantar-worker.md`](levantar-worker.md). Todo sale de `main`: no hay que cambiar de
+> rama.
 
 ---
 

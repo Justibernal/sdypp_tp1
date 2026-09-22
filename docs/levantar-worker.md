@@ -65,13 +65,28 @@ curl -s http://100.78.246.64:8085/health
 
 ## 2 · Bajar el repo y compilar
 
+El worker vive en **`main`**. No hay que cambiar de rama.
+
 ```bash
 git clone https://github.com/Justibernal/sdypp_tp1.git ~/sdypp_servJava
 cd ~/sdypp_servJava
 ./mvnw -q package -DskipTests
 ```
 
+Si ya tenías el repo clonado:
+
+```bash
+cd ~/sdypp_servJava
+git switch main && git pull
+./mvnw -q package -DskipTests
+```
+
 **Qué tenés que ver:** nada. Si no imprime errores, quedó `target/app-java.jar`.
+
+> **Si venís de las instrucciones que circularon por el grupo**, decían
+> `git switch feature/worker-contrato`. Esa rama ya está mergeada en `main` y no hay que
+> usarla más: `main` tiene el worker validado contra el clúster, y es lo único que hay que
+> seguir. Si estás parado ahí, `git switch main && git pull` y listo.
 
 ---
 
