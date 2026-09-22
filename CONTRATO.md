@@ -1,10 +1,11 @@
 # Contrato de servicio — App Java ↔ App Python
 
 **v2.2 · gRPC + Protobuf** — lo que las dos implementaciones tienen que responder **igual** para
-ser intercambiables detrás del balanceador. La **§8 es la propuesta v2.3**: el mismo servicio
-alcanzado por una cola de tareas, pendiente de cerrar con el equipo que la implementa.
+ser intercambiables detrás del balanceador. La **§8 es la v3.0**: el mismo servicio alcanzado
+por la cola de tareas, ya cerrada contra la especificación que publicó el equipo que la
+implementa.
 
-El esquema formal está en **[`contrato.proto`](contrato.proto)**. Acá va lo que el `.proto` no
+El esquema formal está en **[`contrato.proto`](src/main/proto/contrato.proto)**. Acá va lo que el `.proto` no
 puede expresar: validación, orden de los chequeos y semántica de los errores.
 
 > Cada punto está decidido. Si algo hay que cambiar, se cambia acá y sube la versión — no se
@@ -196,17 +197,17 @@ Condiciones sin las cuales el balanceador no puede reenviar tráfico.
 
 ---
 
-## 8. La cola de tareas — v2.4
+## 8. La cola de tareas — v3.0
 
-> **Estado: adaptado al contrato publicado.** La cola la implementa otro equipo y su
-> contrato ya está publicado: `docs/contrato-worker.md` del repo del balanceador, rama
-> `feature/desacople` (contrato del worker **v1**). Lo de acá abajo describe ese contrato y
-> es lo que la App Java implementa y contra lo que está probada.
+> **Estado: cerrado.** El equipo de colas publicó su especificación
+> ([`contrato-worker.md` v1](https://github.com/SDyPPTpGrupal/sdypp_balanceador/blob/feature/desacople/docs/contrato-worker.md))
+> y la App Java está implementada contra ella. Lo que sigue **no la repite**: dice qué toca
+> de *nuestro* lado y qué decisiones nos impone. La fuente de verdad del transporte es el
+> documento de ellos; la de lo que respondemos, el
+> [contrato público](https://github.com/SDyPPTpGrupal/sdypp_balanceador/blob/feature/desacople/docs/contrato-publico.md).
 >
-> Lo que cambió respecto de la v2.3, que era nuestra propuesta a ciegas: las tres operaciones
-> dejaron de ser tres verbos contra una URL y pasaron a ser **tres rutas POST**; apareció el
-> **token**; apareció la **lista de nodos** con descubrimiento del master; y el redirect
-> `421`. Las preguntas que quedan abiertas están en [`docs/worker.md`](../docs/worker.md).
+> Las siete preguntas abiertas de la v2.3 quedaron contestadas, y **casi ninguna como la
+> habíamos supuesto**. La lista de lo que cambió está en [`docs/worker.md`](../docs/worker.md).
 
 El mismo servicio, por un segundo camino: en vez de atender una conexión gRPC, un **worker**
 toma el pedido de una cola, lo resuelve y devuelve la respuesta. El cliente deja de esperar
@@ -222,34 +223,54 @@ contra una conexión abierta, y el que resuelve deja de necesitar ser alcanzable
 Dos colas y no una bidireccional: en `pedidos` hay N consumidores compitiendo por el mismo
 elemento; en `respuestas` cada elemento tiene **un** destinatario y nadie más lo puede tomar.
 
-### 8.2 · Las rutas del worker
+### 8.2 · El endpoint del worker
 
-Tres rutas, las tres **POST con cuerpo JSON**, y las tres contra el **master** del clúster.
-Todas llevan el header `X-Cola-Token` con el token de **consumidor**:
+Cuatro rutas, todas `POST` salvo la de descubrimiento, y todas con la credencial en
+`X-Cola-Token` salvo `/health`:
 
-| Ruta | Cuerpo | Qué hace | Respuesta |
-| :--- | :--- | :--- | :--- |
-| `POST /pedidos/tomar` | `{"consumidor","espera"}` | Toma el próximo pedido y lo **reserva** | `200` con el pedido · `204` si no hubo nada en `espera` |
-| `POST /respuestas` | `{"id","estado","contenido","atendidoPor","app"}` | Devuelve la tarea resuelta | `202` entregada · `409` ver abajo |
-| `POST /pedidos/devolver` | `{"id","consumidor"}` | Suelta un pedido sin resolver (al apagarse) | `200` devuelto · `409` ya no estaba en vuelo |
-| `GET /health` | — (sin token) | Quién es el master y qué versión de contrato habla | `200` |
+| | Qué hace |
+| :--- | :--- |
+| `POST /pedidos/tomar` `{consumidor, espera}` | Toma el próximo pedido y lo **reserva**. `200` con el pedido · `204` si no hubo nada |
+| `POST /respuestas` `{id, estado, contenido, atendidoPor, app}` | Devuelve la tarea resuelta. `202` aceptada · `409` con dos significados |
+| `POST /pedidos/devolver` `{id, consumidor}` | Suelta un pedido sin atenderlo (al apagarse). `200` · `409 no-estaba-en-vuelo` |
+| `GET /health` | Quién es el master, y qué contrato habla. **Sin token** |
 
-El `tomar` es de **long-polling**: el worker se queda esperando hasta `espera` segundos
-(techo 30) y lo despiertan apenas hay trabajo. Con polling corto habría cientos de requests
-por minuto sin trabajo, y cada pedido se vería con el retraso del intervalo.
+El `tomar` es de **long-polling** —techo de 30 s— y el `espera` va en el cuerpo, no en la
+query.
 
-**Sólo el master atiende.** `tomar` no es una lectura: reserva el pedido y lo saca del pool,
-así que no se puede repartir entre nodos — si dos workers tomaran contra dos nodos distintos,
-el mismo pedido se entregaría dos veces. Un nodo que no es el master contesta
-`421 {"error":"no-soy-master","master":"<url>"}`, y el worker actualiza su caché y reintenta
-ahí, sin reiniciar.
+**Hay un master y hay que encontrarlo.** `TP_COLA_URLS` no es una lista de réplicas
+equivalentes sino una **seed list** de un clúster donde sólo el master atiende. La razón no
+es arbitraria: `tomar` **no es una lectura**, es una mutación —reserva el pedido y lo saca
+del pool—, así que repartirla entre nodos entregaría el mismo pedido dos veces. El worker
+descubre el master con `/health`, lo cachea, y le habla sólo a él; un `421 no-soy-master`
+trae la dirección nueva y se reintenta una vez ahí.
 
-**Los dos `409` de `/respuestas` se distinguen por el cuerpo, no por el status:**
+Esto **invirtió una decisión nuestra**: la v2.4 rotaba entre nodos para repartir carga, que
+es lo natural si son réplicas. Contra este clúster eso sería un generador de `421`. Rotar
+estaba bien razonado y era incorrecto — la diferencia no estaba en el razonamiento sino en
+un hecho del otro sistema que no teníamos.
 
-| Cuerpo | Significa | Qué hace el worker |
+**Los dos `409` de `/respuestas` no significan lo mismo**, y se distinguen por el cuerpo y no
+por el status:
+
+| Cuerpo | Qué pasó | Qué hacemos |
 | :--- | :--- | :--- |
-| `{"resultado":"desconocido"}` | el pedido ya lo contestó otro | descarta, no reintenta |
-| `{"resultado":"destinatario-saturado"}` | el balanceador no recolecta | reintenta con backoff |
+| `{"resultado": "desconocido"}` | Otro ya la contestó; llegamos tarde | Descartar. **No es un error del worker** |
+| `{"resultado": "destinatario-saturado"}` | El balanceador no está recolectando | Reintentar con backoff, y contarlo aparte |
+
+Contarlos juntos escondería el segundo, que es el único de los dos que indica un problema.
+
+**El `consumidor` no es un nombre libre.** Tiene que ser el `host:puerto` **gRPC** de la
+réplica, porque es el string con el que el balanceador la tiene registrada y el que publica
+en su `/health` como "réplicas que están consumiendo". Un identificador inventado deja a la
+réplica figurando como sana y sin consumir nada. Por eso `TP_COLA_CONSUMIDOR` **no tiene
+default**: es preferible que el worker no arranque a que arranque con un nombre que nadie va
+a poder cruzar.
+
+**El major del contrato se verifica al arrancar.** `/health` declara `contrato`; si el major
+no es el que implementa el worker, **no arranca** (salida 3). Un major distinto significa que
+algún campo cambió de nombre o que un código cambió de significado: seguir sería responder
+con campos que ya no quieren decir lo mismo, en silencio.
 
 ### 8.3 · El sobre
 
@@ -264,8 +285,8 @@ ahí, sin reiniciar.
 **Respuesta** — lo que el worker devuelve:
 
 ```json
-{"id": "a3f9", "estado": "OK", "atendidoPor": "100.91.134.43:8080", "app": "java",
- "contenido": {"servido_por": "java",
+{"id": "a3f9", "estado": "OK", "atendidoPor": "100.101.15.93:8111", "app": "java",
+ "contenido": {"servidoPor": "java",
                "persona": {"id": 7, "nombre": "Ada Lovelace", "legajo": 100200}}}
 ```
 
@@ -273,9 +294,16 @@ ahí, sin reiniciar.
 | :--- | :--- |
 | `id` | El de la tarea, tal cual vino. Es lo que la cola usa para cerrarla |
 | `estado` | **Nombre del código gRPC**: `OK`, `INVALID_ARGUMENT`, `ALREADY_EXISTS`, `UNAVAILABLE`, `UNIMPLEMENTED`, `DEADLINE_EXCEEDED` |
-| `contenido` | El mensaje del contrato en JSON, **con los nombres de campo del `.proto`** (`servido_por`, no `servidoPor`). ⚠ **Pregunta abierta:** el contrato del otro equipo lo documenta en camelCase (`servidoPor`). El balanceador pasa el `contenido` sin mirarlo, así que hoy no rompe nada, pero es lo que ve el cliente final y conviene cerrarlo antes de la demo |
-| `atendidoPor` | El mismo identificador que el worker manda como `consumidor`: el **`host:puerto` gRPC de la réplica**, que es lo que el balanceador usa como `destino`. No es un nombre libre — si no coincide, la réplica figura sana y sin consumir nada |
+| `contenido` | El mensaje del contrato en JSON, **en camelCase** (`servidoPor`, no `servido_por`) |
+| `atendidoPor` | El mismo `host:puerto` gRPC que el worker manda como `consumidor` |
 | `app` | `"java"` o `"python"`, como en el resto del contrato |
+
+**El `contenido` va en camelCase y no con los nombres del `.proto`.** Es la otra suposición
+que se cayó, y no es cosmética: este objeto es **exactamente** lo que el balanceador le
+publica al cliente final, sin tocar nada — el contrato público lo documenta campo por campo.
+Con los nombres del `.proto`, la misma operación se vería distinta según qué réplica la
+atendió, que es justo lo que las dos implementaciones existen para evitar. El `.proto` sigue
+mandando puertas adentro; la conversión pasa en la frontera (`Ejecutor`), en un solo lugar.
 
 El `destinatario`, los `intentos` y la espera los completa **la cola** con lo que guardó del
 pedido: el worker no tiene por qué saber quién lo pidió, y si se lo preguntáramos podría
@@ -297,13 +325,23 @@ balanceador. La equivalencia con los RPC es la misma de la v1.3 → v2.0:
 | `operacion` | RPC | `parametros` | Idempotente |
 | :--- | :--- | :--- | :--- |
 | `GET /` | `Identidad` | — | sí |
-| `GET /health` | `Salud` | — | sí |
 | `POST /echo` | `Echo` | `ping` | sí |
 | `GET /personas` | `ListarPersonas` | — | sí |
 | `POST /personas` | `CrearPersona` | `nombre`, `legajo` | **no** |
+| `GET /health` | `Salud` | — | sí · *fuera del catálogo de la cola* |
+
+Las cuatro primeras son el catálogo que encola el balanceador. `GET /health` **no está** en
+su tabla —el `/health` público lo contesta él, y es sobre el balanceador y la cola, no sobre
+nuestra app— pero el worker lo sigue entendiendo: sobrar una operación no le cuesta nada a
+nadie, y responder `UNIMPLEMENTED` a algo que alguna vez nos manden sí.
 
 Una operación que no está en la tabla se responde `UNIMPLEMENTED`, nunca con una excepción:
 el pedido llegó bien y el problema es el catálogo, así que reintentarlo no cambiaría nada.
+
+**`legajo` llega siempre como entero**: el balanceador lo normaliza antes de encolar, y un
+cuerpo con un legajo que no es entero lo rechaza él con `400`. La conversión de §8.5 se queda
+igual de todos modos — es nuestra red, no la de ellos, y el día que cambien de criterio el
+worker no se entera por un `500`.
 
 ### 8.5 · Los trece casos borde vuelven
 
@@ -362,3 +400,5 @@ enunciado, resuelta.
 | 2.1 | Salen el RPC `Lenta`, el checksum y el rate limiting: el grupo decidió no usarlos. |
 | **2.2** | Un mensaje de pedido propio por método (`IdentidadPedido`, `SaludPedido`, `ListarPersonasPedido`) en vez de uno compartido. `EstadoSalud.status` pasa de string a **enumerado**. |
 | **2.3** *(propuesta)* | **Segundo camino al mismo servicio: la cola de tareas (§8).** Sobre de pedido y de respuesta, catálogo de operaciones, códigos gRPC como `estado`, la regla de reintento por idempotencia, y la conversión de JSON a los tipos del contrato — que reabre los trece casos borde que la 2.0 había cerrado. La bitácora suma un sexto campo opcional, `tarea=<id>`, que es el id de correlación que faltaba. |
+| **2.4** *(propuesta)* | La cola pasa a ser **varios nodos**: `TP_COLA_URLS` acepta una lista y el worker la rota, con la respuesta volviendo a la réplica que entregó el pedido. Se agrega la **credencial** (`TP_COLA_TOKEN`), con el header y el prefijo configurables porque son especificación del otro equipo. Un nodo caído deja de contar como "cola caída", y un `401` deja de confundirse con uno. |
+| **3.0** | **La §8 deja de ser propuesta: se implementa el `contrato-worker.md v1` publicado.** Cambia el transporte entero (rutas `POST /pedidos/tomar` · `/respuestas` · `/pedidos/devolver`, credencial en `X-Cola-Token`), la seed list pasa de réplicas rotativas a **clúster master/slave con descubrimiento por `/health` y redirect `421`**, los dos `409` se distinguen por el cuerpo, el `contenido` pasa a **camelCase**, el `consumidor` pasa a ser el `host:puerto` gRPC de la réplica, `quedaMs` se usa como timeout y el major del contrato se verifica al arrancar. Es mayor porque **nada de esto es compatible con la 2.4**: un worker viejo contra este clúster no toma un solo pedido. |

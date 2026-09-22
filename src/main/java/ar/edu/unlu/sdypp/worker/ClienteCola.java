@@ -5,60 +5,66 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.net.ConnectException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
 /**
  * El cliente HTTP contra el servicio de colas. <b>Todo lo que depende del contrato del otro
- * equipo está acá adentro</b>: las rutas, el token, los códigos y la forma del cuerpo. El
- * resto del worker habla de tareas, no de HTTP.
+ * equipo está acá adentro</b>: las rutas, la credencial, los códigos, la forma del cuerpo y
+ * el descubrimiento del master. El resto del worker habla de tareas, no de HTTP.
  *
- * <p>Implementa el contrato del worker v1 ({@code docs/contrato-worker.md} del repo del
- * balanceador, rama {@code feature/desacople}). Tres rutas de datos, todas POST con cuerpo
- * JSON y todas contra el <b>master</b> del clúster:
+ * <p>Implementa {@code contrato-worker.md v1} del repositorio del balanceador.
  *
  * <pre>
- *   POST /pedidos/tomar      {"consumidor","espera"}   200 con el pedido · 204 si no hubo
- *   POST /respuestas         {"id","estado",...}       202 entregada · 409 descartada
- *   POST /pedidos/devolver   {"id","consumidor"}       200 devuelto · 409 ya no estaba
- *   GET  /health             (sin token)               descubrimiento y versión del contrato
+ *   POST {master}/pedidos/tomar      {consumidor, espera}     toma el próximo (long-poll)
+ *   POST {master}/respuestas         {id, estado, contenido, atendidoPor, app}
+ *   POST {master}/pedidos/devolver   {id, consumidor}         lo suelta sin atenderlo
+ *   GET  {nodo}/health                                        quién es el master (sin token)
  * </pre>
  *
- * <h2>Por qué hay una lista de nodos y no una URL</h2>
- * La cola es un clúster de N nodos con un único <b>master</b>; los slaves replican y están
- * para tomar la posta si el master cae. <b>Sólo el master atiende</b> — y no es un capricho:
- * {@code tomar} no es una lectura, es una mutación (reserva el pedido y lo saca del pool).
- * Si dos workers pudieran tomar contra dos nodos distintos, el mismo pedido se entregaría
- * dos veces.
+ * <h2>Hay un master, y hay que encontrarlo</h2>
+ * {@code TP_COLA_URLS} no es una lista de réplicas equivalentes: es una <b>seed list</b> de
+ * nodos de un clúster donde <b>sólo el master atiende</b>. La razón no es arbitraria —
+ * {@code tomar} no es una lectura, es una mutación: reserva el pedido y lo saca del pool. Si
+ * dos workers pudieran tomar contra dos nodos distintos, el mismo pedido se entregaría dos
+ * veces.
  *
- * <p>Por eso el worker arranca con una <i>seed list</i>, pregunta quién es el master por
- * {@code /health}, lo cachea y le pega directo. Cuando el master cambia, el nodo viejo
- * contesta {@code 421 Misdirected Request} con la URL del nuevo y el worker se muda solo,
- * <b>sin reiniciar el proceso</b>. Con una lista de un elemento —la situación de hoy— el
- * nodo nunca contesta 421 y esa rama no se ejecuta nunca.
+ * <p>Por eso acá <b>no hay reparto entre nodos</b>, que sería lo natural si fueran réplicas:
+ * se descubre el master una vez, se cachea, y se le habla sólo a él. Pegarle a un slave a
+ * propósito no da más throughput, da 421.
  *
- * <h2>Descubrir cuesta cero en régimen normal</h2>
- * El {@code /health} se consulta al arrancar y cuando algo se rompe, nunca antes de cada
- * operación: en el camino feliz, cada {@code tomar} y cada {@code responder} es un POST
- * directo al master cacheado.
+ * <p>El caché se invalida solo, de dos maneras: un {@code 421} que trae la dirección nueva, o
+ * una conexión que se corta. En los dos casos se vuelve a la seed list. Mientras el clúster
+ * está eligiendo líder no hay master que valga, y lo único sensato es esperar con backoff —
+ * nadie puede inventar un master que todavía no fue electo.
+ *
+ * <h2>Reintentar lo que se puede reintentar</h2>
+ * Un {@code tomar} que falla <b>después</b> de que la request salió no se reintenta: si la
+ * cola llegó a procesarlo, reservó un pedido que este worker nunca vio, y pedir otro dejaría
+ * dos reservados sin saberlo. Sólo se reintenta cuando el fallo es de conexión —
+ * {@link ConnectException}, {@link UnknownHostException}— que son los casos en que la request
+ * <b>no salió</b>. Un {@code responder}, en cambio, se reintenta siempre: el segundo intento
+ * lo descarta la cola con un {@code 409 desconocido}, que es inofensivo.
  *
  * <h2>HTTP/1.1 explícito</h2>
- * El {@code HttpClient} del JDK negocia HTTP/2 por defecto. El servicio de colas es Python
- * sobre {@code ThreadingHTTPServer}, que no lo habla: el intento de upgrade se paga en cada
- * request y con algunos servidores simples directamente falla. Acá no hay streams que
- * multiplexar, así que se fija 1.1 y listo.
+ * El {@code HttpClient} del JDK negocia HTTP/2 por defecto. El servicio de colas es Python y
+ * puede estar sobre un servidor que no lo hable: el intento de upgrade se paga en cada
+ * request y, con algunos servidores simples, directamente falla. Acá no hace falta HTTP/2 —
+ * no hay streams que multiplexar— así que se fija 1.1 y listo.
  */
 public final class ClienteCola {
 
-    /** La cola no respondió, o respondió algo que no se entiende. */
+    /** La cola no respondió, o respondió algo que no se entiende. Se reintenta con backoff. */
     public static final class ColaNoDisponible extends RuntimeException {
         public ColaNoDisponible(String mensaje) {
             super(mensaje);
@@ -69,67 +75,71 @@ public final class ClienteCola {
         }
     }
 
+    /**
+     * El clúster declara un major de contrato distinto del que implementa este worker. No se
+     * reintenta: es fatal a propósito. Operar contra un contrato desconocido significa que
+     * algún campo cambió de nombre o que un código cambió de significado, y seguir adelante
+     * sería adivinar en silencio — exactamente lo que la sección de versionado pide no hacer.
+     */
+    public static final class ContratoIncompatible extends RuntimeException {
+        public ContratoIncompatible(String mensaje) {
+            super(mensaje);
+        }
+    }
+
     /** Qué pasó al devolver la respuesta. */
     public enum Entrega {
-        /** La cola la aceptó y se la va a dar a su destinatario. */
+        /** {@code 202 entregada}. La cola la aceptó y se la va a dar al balanceador. */
         ENTREGADA,
         /**
-         * La cola ya no conoce esa tarea ({@code 409 desconocido}). No es un error del
-         * worker: la reserva venció, otra réplica la resolvió y la nuestra llegó segunda.
-         * La cola descarta la segunda a propósito ("gana la primera respuesta"), así que
-         * reintentar no tiene sentido.
+         * {@code 409 desconocido}. El pedido ya lo contestó otro: se nos venció la reserva y
+         * llegamos segundos. La cola se queda con la primera a propósito, así que reintentar
+         * no tiene sentido. <b>No es un error del worker.</b>
          */
         DESCARTADA,
         /**
-         * El destinatario está saturado ({@code 409 destinatario-saturado}): el balanceador
-         * que espera esta respuesta hace rato que no recolecta, casi siempre porque se cayó.
-         * A diferencia de DESCARTADA, <b>acá reintentar sí puede servir</b> —el balanceador
-         * puede volver— así que se reintenta con backoff antes de darla por perdida.
+         * {@code 409 destinatario-saturado}. El balanceador no está recolectando. La
+         * respuesta es buena; el que no la está levantando es el otro extremo.
          */
-        SATURADA,
-        /** No se pudo entregar: la cola no responde y se agotaron los reintentos. */
-        PERDIDA
+        SATURADO
     }
 
-    /** Techo del long-poll que fija el contrato. Pedir más no da más. */
-    private static final int ESPERA_MAXIMA = 30;
+    /** Lo que dice {@code GET /health} de un nodo. */
+    public static final class Salud {
+        public final String rol;
+        public final String masterConocido;
+        public final String contrato;
+        public final String instancia;
 
-    /** Una respuesta HTTP ya parseada. El cuerpo puede ser null: un 204 no lo tiene. */
-    private static final class Respuesta {
-        final int codigo;
-        final JsonObject cuerpo;
-
-        Respuesta(int codigo, JsonObject cuerpo) {
-            this.codigo = codigo;
-            this.cuerpo = cuerpo;
-        }
-
-        String texto(String clave) {
-            return ClienteCola.texto(cuerpo, clave);
+        Salud(String rol, String masterConocido, String contrato, String instancia) {
+            this.rol = rol;
+            this.masterConocido = masterConocido;
+            this.contrato = contrato;
+            this.instancia = instancia;
         }
     }
 
-    private final List<String> semillas;
-    private final String token;
+    private static final String RUTA_TOMAR = "/pedidos/tomar";
+    private static final String RUTA_RESPONDER = "/respuestas";
+    private static final String RUTA_DEVOLVER = "/pedidos/devolver";
+    private static final String RUTA_SALUD = "/health";
+
+    private final List<URI> semillas;
     private final String consumidor;
     private final HttpClient http;
 
     /**
-     * La URL del master, cacheada. {@code volatile} porque la escriben y la leen todos los
-     * hilos consumidores: sin eso, el que descubre el master nuevo lo deja en su caché de
-     * CPU y los demás siguen pegándole al viejo.
+     * El master, cacheado. {@code volatile} y no por hilo: los consumidores comparten el
+     * descubrimiento, así que cuando uno se entera de que el master cambió, los demás dejan
+     * de pegarle al viejo sin tener que chocarse cada uno con su propio 421.
      */
-    private volatile String master = null;
+    private volatile URI maestro;
 
-    /** Para avisar una sola vez que la cola no expone devolución, y no en cada apagado. */
-    private final AtomicBoolean avisoDevolucion = new AtomicBoolean(false);
+    /** Para avisar una sola vez del contrato que no se pudo verificar al arrancar. */
+    private final AtomicBoolean avisoContrato = new AtomicBoolean(false);
 
-    public ClienteCola(String urls, String token, String consumidor) {
-        this.semillas = separar(urls);
-        if (this.semillas.isEmpty()) {
-            throw new IllegalArgumentException("la lista de nodos de cola está vacía");
-        }
-        this.token = token == null ? "" : token.trim();
+    public ClienteCola(String urls, String consumidor) {
+        this.semillas = semillasDe(urls);
         this.consumidor = consumidor;
         this.http = HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
@@ -137,68 +147,137 @@ public final class ClienteCola {
                 .build();
     }
 
-    /** Las semillas, para mostrarlas al arrancar. */
-    public List<String> nodos() {
-        return semillas;
-    }
-
-    /** El master vigente según la caché, o null si todavía no se descubrió. */
-    public String master() {
-        return master;
+    /** Los nodos de la seed list: uno por coma. Con uno solo funciona igual. */
+    static List<URI> semillasDe(String urls) {
+        List<URI> lista = new ArrayList<>();
+        for (String parte : urls.split(",")) {
+            String base = parte.strip();
+            if (base.isEmpty()) {
+                continue;
+            }
+            while (base.endsWith("/")) {
+                base = base.substring(0, base.length() - 1);
+            }
+            URI uri = URI.create(base);
+            if (uri.getScheme() == null || uri.getHost() == null) {
+                throw new IllegalArgumentException(
+                        "URL de cola sin esquema o sin host: " + parte.strip());
+            }
+            lista.add(uri);
+        }
+        if (lista.isEmpty()) {
+            throw new IllegalArgumentException("TP_COLA_URLS no trae ninguna URL");
+        }
+        return List.copyOf(lista);
     }
 
     public String destino() {
-        String actual = master;
-        return actual != null ? actual : String.join(",", semillas);
+        return semillas.stream().map(URI::toString).collect(Collectors.joining(" · "));
     }
 
-    // --- las rutas del worker ------------------------------------------------------------
+    public int cuantosNodos() {
+        return semillas.size();
+    }
+
+    /** El master que se está usando, o null si todavía no se lo encontró. */
+    public String maestroActual() {
+        URI m = maestro;
+        return m == null ? null : m.toString();
+    }
+
+    // --- arranque ----------------------------------------------------------------------
 
     /**
-     * Toma el próximo pedido. Devuelve null si no hubo nada en {@code espera} segundos —
+     * Ubica el master y compara el major del contrato. Devuelve una línea para el log.
+     *
+     * <p>Un major distinto es <b>fatal</b>. No llegar a ninguno, en cambio, no lo es: el
+     * clúster puede estar eligiendo líder o esta casa puede haber arrancado antes que la
+     * cola, y un worker que se niega a arrancar porque la cola no está todavía es un worker
+     * que hay que levantar a mano justo cuando la cola vuelve. Se avisa y se sigue; el ciclo
+     * normal reintenta con backoff y verifica de nuevo cuando por fin conteste.
+     */
+    public String verificar() {
+        Salud salud = buscarSalud();
+        if (salud == null) {
+            return "no se pudo hablar con ningún nodo todavía — se reintenta con backoff";
+        }
+        exigirContrato(salud);
+        URI m = maestro;
+        return "contrato " + salud.contrato + " · master " + (m == null ? "(en elección)" : m)
+                + (salud.instancia == null ? "" : " · " + salud.instancia);
+    }
+
+    /**
+     * Compara el major declarado con el que implementa este worker. El minor no se mira: por
+     * la regla de versionado de ellos, un minor nuevo sólo agrega campos opcionales, y
+     * campos de más no rompen a nadie.
+     */
+    private void exigirContrato(Salud salud) {
+        if (salud.contrato == null || salud.contrato.isBlank()) {
+            if (avisoContrato.compareAndSet(false, true)) {
+                System.out.println("[cola] el nodo no declara versión de contrato: se asume "
+                        + Config.COLA_CONTRATO + ".x");
+            }
+            return;
+        }
+        String major = salud.contrato.split("\\.")[0].strip();
+        if (!major.equals(Config.COLA_CONTRATO)) {
+            throw new ContratoIncompatible("la cola habla contrato " + salud.contrato
+                    + " y este worker implementa el " + Config.COLA_CONTRATO + ".x."
+                    + " Un major distinto significa que algún campo cambió de nombre o que un"
+                    + " código cambió de significado: hay que actualizar el worker, no forzarlo"
+                    + " (o TP_COLA_CONTRATO=" + major + " si ya se revisó que es compatible).");
+        }
+    }
+
+    // --- las tres operaciones ----------------------------------------------------------
+
+    /**
+     * Toma el próximo pedido. Devuelve null si no hubo trabajo en {@code espera} segundos —
      * que es lo normal y no un error.
      *
      * <p>El timeout de la request es la espera más un margen: si fuera igual, el worker
      * cortaría por su cuenta justo cuando la cola está por contestar que no hay nada, y cada
-     * vuelta en vacío parecería una caída de la cola.
+     * vuelta en vacío parecería una caída del clúster.
      */
     public Tarea tomar(int espera) {
-        int segundos = Math.max(0, Math.min(espera, ESPERA_MAXIMA));
         JsonObject cuerpo = new JsonObject();
         cuerpo.addProperty("consumidor", consumidor);
-        cuerpo.addProperty("espera", segundos);
+        cuerpo.addProperty("espera", espera);
 
-        Respuesta respuesta = pedir("/pedidos/tomar", cuerpo, Duration.ofSeconds(segundos + 10L));
+        // reintentarSiSeCorta = false: un tomar que se corta después de salir pudo haber
+        // reservado un pedido que nunca vimos.
+        HttpResponse<String> respuesta = pedir(RUTA_TOMAR, cuerpo.toString(),
+                Duration.ofSeconds(espera + 10L), false);
+        int codigo = respuesta.statusCode();
 
-        // 204 y sólo 204 significa "no hubo trabajo". Un 404 acá NO es cola vacía: es la
-        // ruta equivocada, y tratarlo como vacío deja al worker girando en silencio —sano
-        // para el healthcheck y sin resolver nada—. Es la peor falla posible porque no se
-        // ve, así que sale por la excepción y el worker la registra.
-        if (respuesta.codigo == 204) {
+        if (codigo == 204) {
             return null;
         }
-        if (respuesta.codigo != 200) {
-            throw new ColaNoDisponible("/pedidos/tomar devolvió " + respuesta.codigo
-                    + ": " + recortar(respuesta.cuerpo));
-        }
-        if (respuesta.cuerpo == null) {
-            throw new ColaNoDisponible("/pedidos/tomar devolvió 200 con el cuerpo vacío");
+        if (codigo != 200) {
+            throw new ColaNoDisponible(explicar(codigo, respuesta.body(), "pedir trabajo"));
         }
 
-        Tarea tarea = Tarea.desde(respuesta.cuerpo);
+        JsonObject sobre = objetoDe(respuesta.body());
+        if (sobre == null) {
+            // 200 con cuerpo vacío no está en el contrato, pero significar otra cosa que "no
+            // hay nada" sería peor: se trata como un 204 y se vuelve a llamar.
+            return null;
+        }
+        Tarea tarea = Tarea.desde(sobre, maestro);
         if (!tarea.valida()) {
             throw new ColaNoDisponible("la cola entregó un pedido sin id o sin operación: "
-                    + recortar(respuesta.cuerpo));
+                    + recortar(respuesta.body()));
         }
         return tarea;
     }
 
     /**
-     * Devuelve la tarea resuelta. El cuerpo lleva sólo lo que el worker sabe: quién la
-     * atendió y con qué resultado. El {@code destinatario} y los {@code intentos} los
-     * completa la cola con lo que guardó del pedido — el worker no tiene por qué saber quién
-     * lo pidió, y si se lo preguntáramos podría apuntar a otro balanceador y meterle una
-     * respuesta ajena.
+     * Devuelve la tarea resuelta.
+     *
+     * <p>No lleva {@code destinatario}: lo pone la cola con lo que guardó del pedido. El
+     * worker no tiene por qué saber quién lo pidió, y si se lo preguntáramos podría apuntar a
+     * otro balanceador y meterle una respuesta ajena.
      */
     public Entrega responder(Tarea tarea, Ejecutor.Resuelta resuelta) {
         JsonObject cuerpo = new JsonObject();
@@ -208,34 +287,36 @@ public final class ClienteCola {
         cuerpo.addProperty("atendidoPor", consumidor);
         cuerpo.addProperty("app", Config.APP);
 
-        Respuesta respuesta = pedir("/respuestas", cuerpo, Duration.ofSeconds(10));
+        // Acá sí se reintenta si la conexión se corta: si la cola llegó a procesarla, el
+        // segundo intento vuelve con 409 desconocido y no pasa nada.
+        HttpResponse<String> respuesta = pedir(RUTA_RESPONDER, cuerpo.toString(),
+                Duration.ofSeconds(10), true);
+        int codigo = respuesta.statusCode();
 
-        if (respuesta.codigo >= 200 && respuesta.codigo < 300) {
+        if (codigo >= 200 && codigo < 300) {
             return Entrega.ENTREGADA;
         }
-        // Los dos 409 de esta ruta se distinguen POR EL CUERPO y se tratan distinto. El
-        // redirect de master ya no comparte código con ellos —es 421 desde la versión
-        // vigente del contrato—, pero estos dos siguen compartiendo el 409 entre sí.
-        if (respuesta.codigo == 409) {
-            String resultado = respuesta.texto("resultado");
+        if (codigo == 409) {
+            // Los dos 409 se distinguen POR EL CUERPO y no por el status: uno dice "llegaste
+            // tarde, tirala" y el otro "el de enfrente no está levantando respuestas".
+            // Tratarlos igual haría desaparecer en silencio respuestas que sí valían.
+            String resultado = textoDe(objetoDe(respuesta.body()), "resultado");
             if ("destinatario-saturado".equals(resultado)) {
-                return Entrega.SATURADA;
+                return Entrega.SATURADO;
             }
-            return Entrega.DESCARTADA;   // "desconocido": llegamos segundos, hay que tirarla
+            return Entrega.DESCARTADA;
         }
-        throw new ColaNoDisponible("/respuestas devolvió " + respuesta.codigo
-                + ": " + recortar(respuesta.cuerpo));
+        throw new ColaNoDisponible(explicar(codigo, respuesta.body(), "entregar la respuesta"));
     }
 
     /**
-     * Suelta un pedido sin resolver. Se usa al apagarse: soltarlo lo manda al frente de la
-     * cola y otro worker lo toma en el acto, mientras que quedarse callado obliga a esperar
-     * a que venza la reserva —y, si la operación no es idempotente, la cola ni siquiera la
-     * reintenta: el cliente se come un DEADLINE_EXCEEDED por una réplica que se apagó
-     * ordenadamente.
+     * Suelta un pedido sin atenderlo. Se usa al apagarse: soltarlo lo devuelve al pool y otro
+     * worker lo toma en el acto, mientras que quedarse callado obliga a esperar a que venza
+     * la reserva — y, si la operación no es idempotente, la cola ni siquiera la reintenta: el
+     * cliente se come un DEADLINE_EXCEEDED por una réplica que se apagó ordenadamente.
      *
      * <p>Es una optimización, no una garantía: si no se llega a devolver, el recuperador de
-     * la cola lo hace igual, sólo que más tarde.
+     * la cola lo hace igual, sólo más tarde. Por eso nunca tira excepción.
      */
     public boolean devolver(Tarea tarea) {
         try {
@@ -243,19 +324,18 @@ public final class ClienteCola {
             cuerpo.addProperty("id", tarea.id);
             cuerpo.addProperty("consumidor", consumidor);
 
-            Respuesta respuesta = pedir("/pedidos/devolver", cuerpo, Duration.ofSeconds(5));
-            if (respuesta.codigo >= 200 && respuesta.codigo < 300) {
+            HttpResponse<String> respuesta = pedir(RUTA_DEVOLVER, cuerpo.toString(),
+                    Duration.ofSeconds(5), true);
+            int codigo = respuesta.statusCode();
+            if (codigo >= 200 && codigo < 300) {
                 return true;
             }
-            // 409 "no-estaba-en-vuelo": la reserva ya venció y el recuperador se nos
-            // adelantó. Es normal y no hay nada que hacer.
-            if (respuesta.codigo == 409) {
+            if (codigo == 409) {
+                // "no-estaba-en-vuelo": la reserva ya venció. No hay nada que hacer.
                 return false;
             }
-            if (avisoDevolucion.compareAndSet(false, true)) {
-                System.out.println("[cola] /pedidos/devolver respondió " + respuesta.codigo
-                        + ": los tomados sin resolver esperan a que venza la reserva");
-            }
+            System.out.println("[cola] no se pudo devolver la " + tarea + ": "
+                    + explicar(codigo, respuesta.body(), "devolver el pedido"));
             return false;
         } catch (RuntimeException e) {
             System.out.println("[cola] no se pudo devolver la " + tarea + ": " + e.getMessage());
@@ -263,188 +343,187 @@ public final class ClienteCola {
         }
     }
 
-    /**
-     * El {@code /health} del primer nodo que conteste, o null si no contesta ninguno.
-     * Sin token: el contrato lo deja abierto justamente para que sirva de descubrimiento.
-     */
-    public JsonObject salud() {
-        for (String url : semillas) {
-            try {
-                Respuesta respuesta = consultarSalud(url);
-                if (respuesta.codigo == 200 && respuesta.cuerpo != null) {
-                    return respuesta.cuerpo;
-                }
-            } catch (ColaNoDisponible e) {
-                // Un nodo caído en la seed list es esperable: se prueba el siguiente.
-            }
-        }
-        return null;
-    }
-
-    // --- descubrimiento del master -------------------------------------------------------
+    // --- descubrimiento del master -----------------------------------------------------
 
     /**
-     * El corazón del cliente: manda la operación al master y, si el caché quedó viejo, sigue
-     * el redirect una vez.
-     *
-     * <p>Dos intentos y no un bucle: un redirect alcanza para el caso real —el master
-     * cambió—, y un bucle abierto contra un clúster que está en elección gira sin dormir y
-     * le pone la CPU al 100%. Cuando los dos intentos fallan se lanza la excepción, y el
-     * backoff exponencial lo hace el worker, en un solo lugar.
+     * Un POST al master, siguiendo el redirect si el caché quedó viejo. Dos vueltas como
+     * mucho: una para el intento normal y otra para el redirect o el redescubrimiento. Más
+     * vueltas no ayudarían — si el master cambió dos veces en el tiempo de una request, lo
+     * que hace falta es esperar, y de eso se encarga el backoff del consumidor.
      */
-    private Respuesta pedir(String ruta, JsonObject cuerpo, Duration timeout) {
-        ColaNoDisponible ultima = null;
+    private HttpResponse<String> pedir(String ruta, String cuerpo, Duration timeout,
+                                       boolean reintentarSiSeCorta) {
+        RuntimeException ultimo = null;
 
-        for (int intento = 1; intento <= 2; intento++) {
-            String nodo = master;
-            if (nodo == null) {
-                nodo = descubrirMaster();
-                if (nodo == null) {
-                    throw new ColaNoDisponible("el clúster de colas no tiene master "
-                            + "(elección en curso o nodos caídos): " + String.join(",", semillas));
+        for (int vuelta = 0; vuelta < 2; vuelta++) {
+            URI actual = maestro;
+            if (actual == null) {
+                actual = ubicarMaestro();
+                if (actual == null) {
+                    throw new ColaNoDisponible(
+                            "el clúster no tiene master (elección en curso o todos caídos)");
                 }
-                master = nodo;
             }
 
-            Respuesta respuesta;
+            HttpResponse<String> respuesta;
             try {
-                respuesta = enviar(nodo + ruta, cuerpo, timeout);
+                respuesta = enviar(HttpRequest.newBuilder()
+                        .uri(actual.resolve(ruta))
+                        .timeout(timeout)
+                        .header("Content-Type", "application/json; charset=utf-8")
+                        .header("Accept", "application/json")
+                        .header(Config.COLA_AUTH, valorDelToken())
+                        .POST(HttpRequest.BodyPublishers.ofString(cuerpo, StandardCharsets.UTF_8))
+                        .build());
             } catch (ColaNoDisponible e) {
-                // El master se cayó: se olvida y en la vuelta siguiente se redescubre.
-                master = null;
-                ultima = e;
+                // El master se cayó: hay que redescubrirlo. Pero sólo se repite la operación
+                // si el fallo dice que la request NO salió.
+                maestro = null;
+                if (Thread.currentThread().isInterrupted()) {
+                    throw e;
+                }
+                if (!reintentarSiSeCorta && !noSalio(e)) {
+                    throw e;
+                }
+                ultimo = e;
                 continue;
             }
 
-            // 421 Misdirected Request: le pegamos a un nodo que no es el master. El cuerpo
-            // trae quién lo es — o null, si hay una elección en curso y nadie lo sabe
-            // todavía, en cuyo caso se vuelve a la seed list en la próxima vuelta.
-            if (respuesta.codigo == 421) {
-                String nuevo = respuesta.texto("master");
-                master = (nuevo == null || nuevo.isBlank()) ? null : normalizar(nuevo);
-                ultima = new ColaNoDisponible("el nodo contestó 421 y el master quedó sin resolver");
+            if (respuesta.statusCode() == 421) {
+                // "no-soy-master": el cuerpo trae a quién hay que preguntarle.
+                String nuevo = textoDe(objetoDe(respuesta.body()), "master");
+                maestro = (nuevo == null || nuevo.isBlank()) ? null : URI.create(nuevo);
+                if (maestro == null) {
+                    throw new ColaNoDisponible("hay un cambio de master en curso");
+                }
+                ultimo = new ColaNoDisponible("el master cambió a " + maestro);
                 continue;
             }
 
-            // El 403 no es "la cola está mal": es "este worker no tiene el token de
-            // consumidor". Se dice con esas palabras porque es un error de configuración y
-            // el mensaje es lo único que lo delata — el síntoma es idéntico al de una cola
-            // caída, y sin esto se buscaría en el lugar equivocado.
-            if (respuesta.codigo == 403) {
-                throw new ColaNoDisponible("403 en " + ruta + ": token de consumidor "
-                        + (token.isEmpty() ? "ausente (falta TP_COLA_TOKEN)" : "inválido"));
-            }
-
+            maestro = actual;
             return respuesta;
         }
+        throw ultimo != null ? ultimo : new ColaNoDisponible("no se pudo ubicar al master");
+    }
 
-        throw ultima != null ? ultima
-                : new ColaNoDisponible("no se pudo resolver el master para " + ruta);
+    /** Recorre la seed list hasta dar con el master. null si el clúster está en elección. */
+    private URI ubicarMaestro() {
+        Salud salud = buscarSalud();
+        if (salud != null) {
+            exigirContrato(salud);
+        }
+        return maestro;
     }
 
     /**
-     * Recorre la seed list hasta encontrar quién es el master. Devuelve null si el clúster
-     * está en elección o si no contesta nadie — las dos son situaciones transitorias, y el
-     * que llama duerme con backoff.
+     * Pregunta {@code /health} nodo por nodo. Deja el master en el caché si lo encuentra y
+     * devuelve la salud del primer nodo que haya contestado — que sirve para la versión del
+     * contrato aunque ese nodo sea un slave.
      */
-    private String descubrirMaster() {
-        for (String url : semillas) {
-            Respuesta respuesta;
+    private Salud buscarSalud() {
+        Salud primera = null;
+        for (URI semilla : semillas) {
+            Salud salud;
             try {
-                respuesta = consultarSalud(url);
-            } catch (ColaNoDisponible e) {
-                continue;               // nodo caído: el siguiente
+                salud = salud(semilla);
+            } catch (RuntimeException e) {
+                continue; // nodo caído: el siguiente
             }
-            if (respuesta.codigo != 200 || respuesta.cuerpo == null) {
-                continue;
+            if (primera == null) {
+                primera = salud;
             }
-
-            String rol = respuesta.texto("rol");
-            if ("master".equals(rol)) {
-                return url;
+            if ("master".equals(salud.rol)) {
+                maestro = semilla;
+                return salud;
             }
-            String conocido = respuesta.texto("masterConocido");
-            if (conocido != null && !conocido.isBlank()) {
-                return normalizar(conocido);
-            }
-            // Un nodo sano que no declara rol ni master es el nodo único de hoy, anterior al
-            // clúster: es el master por definición, porque no hay otro. Sin este caso el
-            // worker no arrancaría contra la cola que está desplegada ahora mismo.
-            if (rol == null && respuesta.cuerpo.has("cola")) {
-                return url;
+            if (salud.masterConocido != null && !salud.masterConocido.isBlank()) {
+                maestro = URI.create(salud.masterConocido);
+                return salud;
             }
         }
-        return null;
+        return primera; // alguien contestó pero nadie sabe quién manda: elección en curso
     }
 
-    // --- HTTP ----------------------------------------------------------------------------
-
-    private Respuesta enviar(String url, JsonObject cuerpo, Duration timeout) {
-        HttpRequest.Builder constructor = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(timeout)
-                .header("Content-Type", "application/json; charset=utf-8")
-                .header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(cuerpo.toString(), StandardCharsets.UTF_8));
-        if (!token.isEmpty()) {
-            constructor.header("X-Cola-Token", token);
-        }
-        return recibir(constructor.build(), url);
-    }
-
-    /** El {@code /health} va sin token: el contrato lo deja abierto para el descubrimiento. */
-    private Respuesta consultarSalud(String url) {
-        return recibir(HttpRequest.newBuilder()
-                .uri(URI.create(url + "/health"))
+    /** {@code GET /health} de un nodo. No lleva token: es la ruta de descubrimiento. */
+    public Salud salud(URI nodo) {
+        HttpResponse<String> respuesta = enviar(HttpRequest.newBuilder()
+                .uri(nodo.resolve(RUTA_SALUD))
                 .timeout(Duration.ofSeconds(5))
                 .header("Accept", "application/json")
                 .GET()
-                .build(), url + "/health");
-    }
-
-    private Respuesta recibir(HttpRequest pedido, String url) {
-        HttpResponse<String> respuesta;
-        try {
-            respuesta = http.send(pedido, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new ColaNoDisponible("interrumpido hablando con " + url, e);
-        } catch (Exception e) {
-            throw new ColaNoDisponible("no se pudo hablar con " + url + ": " + e, e);
+                .build());
+        if (respuesta.statusCode() != 200) {
+            throw new ColaNoDisponible(nodo.getHost() + " respondió "
+                    + respuesta.statusCode() + " en " + RUTA_SALUD);
         }
-        return new Respuesta(respuesta.statusCode(), objetoDe(respuesta.body()));
+        JsonObject o = objetoDe(respuesta.body());
+        if (o == null) {
+            throw new ColaNoDisponible(nodo.getHost() + " devolvió un " + RUTA_SALUD + " vacío");
+        }
+        return new Salud(textoDe(o, "rol"), textoDe(o, "masterConocido"),
+                textoDe(o, "contrato"), textoDe(o, "instancia"));
     }
 
-    // --- interno -------------------------------------------------------------------------
+    // --- interno -----------------------------------------------------------------------
 
     /**
-     * La seed list, normalizada. Se sacan la barra final y los vacíos: la ruta se concatena
-     * después ({@code url + "/pedidos/tomar"}) y una barra de más da un 404 que cuesta un
-     * rato entender.
+     * El valor del header de la credencial. Por el contrato va pelado
+     * ({@code X-Cola-Token: <token>}); el esquema queda configurable por si cambian de idea,
+     * porque sigue siendo especificación de otro equipo.
      */
-    private static List<String> separar(String urls) {
-        List<String> lista = new ArrayList<>();
-        if (urls == null) {
-            return lista;
+    private static String valorDelToken() {
+        return Config.COLA_ESQUEMA.isBlank()
+                ? Config.COLA_TOKEN
+                : Config.COLA_ESQUEMA + " " + Config.COLA_TOKEN;
+    }
+
+    /**
+     * Un mensaje que dice qué hacer, no sólo qué pasó. El {@code 403} es el que más se va a
+     * ver mientras se ajusta el entorno, y el que peor se diagnostica solo: el token de
+     * consumidor habilita únicamente las rutas del worker.
+     *
+     * <p>Nunca imprime el token: el log va a un archivo del disco de la casa y una credencial
+     * en claro ahí no se borra nunca más.
+     */
+    private static String explicar(int codigo, String cuerpo, String que) {
+        if (codigo == 403) {
+            return "la cola rechazó la credencial al " + que + " (403)"
+                    + (Config.COLA_TOKEN.isBlank()
+                       ? " y no se mandó ninguna: falta TP_COLA_TOKEN"
+                       : " — revisar TP_COLA_TOKEN (va en el header " + Config.COLA_AUTH + ")");
         }
-        for (String parte : urls.split(",")) {
-            String limpia = normalizar(parte);
-            if (!limpia.isEmpty() && !lista.contains(limpia)) {
-                lista.add(limpia);
+        return "la cola respondió " + codigo + " al " + que + ": " + recortar(cuerpo);
+    }
+
+    /**
+     * ¿El fallo garantiza que la request no llegó a salir? Sólo entonces se puede repetir un
+     * {@code tomar} sin arriesgar dos pedidos reservados. Un timeout no cuenta: la request
+     * salió y no sabemos si la procesaron.
+     */
+    private static boolean noSalio(Throwable e) {
+        for (Throwable causa = e; causa != null; causa = causa.getCause()) {
+            if (causa instanceof ConnectException || causa instanceof UnknownHostException) {
+                return true;
+            }
+            if (causa == causa.getCause()) {
+                break;
             }
         }
-        return Collections.unmodifiableList(lista);
+        return false;
     }
 
-    private static String normalizar(String url) {
-        String limpia = url == null ? "" : url.trim();
-        while (limpia.endsWith("/")) {
-            limpia = limpia.substring(0, limpia.length() - 1);
+    private HttpResponse<String> enviar(HttpRequest pedido) {
+        try {
+            return http.send(pedido, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new ColaNoDisponible("interrumpido hablando con la cola", e);
+        } catch (Exception e) {
+            throw new ColaNoDisponible(e.toString(), e);
         }
-        return limpia;
     }
 
-    /** El objeto del cuerpo, o null si no hay cuerpo (un 204) o si no es un objeto. */
+    /** El objeto del cuerpo, o null si no hay nada que leer. */
     private static JsonObject objetoDe(String cuerpo) {
         if (cuerpo == null || cuerpo.isBlank()) {
             return null;
@@ -462,24 +541,20 @@ public final class ClienteCola {
         return objeto.isEmpty() ? null : objeto;
     }
 
-    private static String texto(JsonObject objeto, String clave) {
-        if (objeto == null) {
+    private static String textoDe(JsonObject o, String clave) {
+        if (o == null) {
             return null;
         }
-        JsonElement e = objeto.get(clave);
+        JsonElement e = o.get(clave);
         if (e == null || e.isJsonNull() || !e.isJsonPrimitive()) {
             return null;
         }
         return e.getAsString();
     }
 
-    private static String recortar(JsonObject cuerpo) {
-        return recortar(cuerpo == null ? null : cuerpo.toString());
-    }
-
     /** Para que un cuerpo de error enorme no llene la bitácora de una línea. */
     private static String recortar(String texto) {
-        if (texto == null) {
+        if (texto == null || texto.isBlank()) {
             return "(vacío)";
         }
         String limpio = texto.strip().replaceAll("\\s+", " ");

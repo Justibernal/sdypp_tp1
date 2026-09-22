@@ -3,6 +3,8 @@ package ar.edu.unlu.sdypp.worker;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
+import java.net.URI;
+
 /**
  * Un pedido tomado de la cola, tal como lo entrega el servicio del equipo de la cola.
  *
@@ -35,8 +37,19 @@ public final class Tarea {
     public final long quedaMs;
     public final int intento;
 
+    /**
+     * La réplica de la cola que entregó este pedido. No viene en el sobre: lo agrega el
+     * {@link ClienteCola} al recibirlo.
+     *
+     * <p>Hace falta porque la cola corre en varios nodos y <b>la reserva la tiene el que
+     * nos dio la tarea</b>. Devolverle la respuesta a otra réplica sería, en el mejor caso,
+     * un rodeo; y si los nodos no comparten el estado, un {@code 404} que haríamos pasar
+     * por "otro llegó primero" — tirando una respuesta que nadie más va a dar.
+     */
+    public final URI origen;
+
     private Tarea(String id, String operacion, JsonObject parametros, boolean idempotente,
-                  String cliente, long quedaMs, int intento) {
+                  String cliente, long quedaMs, int intento, URI origen) {
         this.id = id;
         this.operacion = operacion;
         this.parametros = parametros;
@@ -44,9 +57,10 @@ public final class Tarea {
         this.cliente = cliente;
         this.quedaMs = quedaMs;
         this.intento = intento;
+        this.origen = origen;
     }
 
-    public static Tarea desde(JsonObject sobre) {
+    public static Tarea desde(JsonObject sobre, URI origen) {
         return new Tarea(
                 // El id puede venir como string o como número: la cola lo genera y todavía
                 // no dijo cuál de los dos. Se guarda siempre como texto, que sirve para los
@@ -57,7 +71,8 @@ public final class Tarea {
                 booleano(sobre, "idempotente"),
                 texto(sobre, "cliente"),
                 entero(sobre, "quedaMs", SIN_PRESUPUESTO),
-                (int) entero(sobre, "intento", 0));
+                (int) entero(sobre, "intento", 0),
+                origen);
     }
 
     /** Si ya se le acabó el presupuesto no hay que ejecutarla: nadie va a leer la respuesta. */
