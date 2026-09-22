@@ -24,6 +24,9 @@ COPY --from=build /build/target/app-java.jar /app/app-java.jar
 RUN mkdir -p /app/logs && chown -R app:app /app
 USER app
 
+# TP_COLA_URLS, TP_COLA_TOKEN y TP_COLA_CONSUMIDOR NO tienen default a propósito: son el
+# contrato con el otro equipo y un default inventado hace que el worker arranque hablándole
+# a nadie. Se pasan con -e al correr (ver deploy/worker.sh).
 ENV TP_LOGS=/app/logs TP_COLA_ADMIN=9091
 
 # El worker NO expone un puerto de servicio: nadie le habla, es él quien va a buscar

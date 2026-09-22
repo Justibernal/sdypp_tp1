@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * alcanzar la cola.
  *
  * <pre>
- *   TP_COLA_URL=http://cola:8000/tareas TP_REDIS_URL=redis://sdypp-redis:6379/0 \
+ *   TP_COLA_URLS=http://nodo1:8085,http://nodo2:8085 TP_COLA_TOKEN=... \
  *     java -cp target/app-java.jar ar.edu.unlu.sdypp.worker.Worker
  * </pre>
  *
@@ -72,6 +72,8 @@ public final class Worker {
     private static final AtomicLong RESUELTAS = new AtomicLong();
     private static final AtomicLong FALLIDAS = new AtomicLong();
     private static final AtomicLong DESCARTADAS = new AtomicLong();
+    /** 409 destinatario-saturado: la respuesta era buena y el balanceador no la levantó. */
+    private static final AtomicLong SATURADAS = new AtomicLong();
     private static final AtomicLong PERDIDAS = new AtomicLong();
     private static final AtomicLong VACIAS = new AtomicLong();
     private static final AtomicLong ERRORES_COLA = new AtomicLong();
@@ -82,29 +84,88 @@ public final class Worker {
     private static volatile String ultimoError = null;
     private static volatile String ultimaTarea = null;
 
+    /**
+     * Las réplicas de cola configuradas, para que /estado diga contra qué está hablando.
+     * Con tres URLs en una variable de entorno, "a cuál le está pegando" deja de ser obvio
+     * — y es lo primero que se pregunta cuando no entra trabajo.
+     */
+    private static volatile String colaDestino = "";
+
+    /** Para que /estado pueda decir contra qué master está hablando ahora mismo. */
+    private static volatile ClienteCola clienteCola;
+
     private Worker() {
     }
 
     public static void main(String[] args) throws Exception {
         String url = args.length > 0 ? args[0] : Config.COLA_URL;
         if (url.isBlank()) {
-            System.out.println("Falta TP_COLA_URL (o pasar la URL como primer argumento).");
-            System.out.println("  ej: TP_COLA_URL=http://localhost:8000/tareas java -cp app-java.jar "
-                    + Worker.class.getName());
+            System.out.println("Falta TP_COLA_URLS: la seed list de nodos de cola, separada por coma.");
+            System.out.println("  ej: TP_COLA_URLS=http://10.0.0.1:8085,http://10.0.0.2:8085");
             System.exit(2);
+        }
+
+        // El consumidor NO tiene default. El contrato de la cola pide el host:puerto gRPC de
+        // la réplica, porque ese string es el que el balanceador publica en su /health como
+        // "réplicas que están consumiendo". Uno inventado deja a la réplica figurando como
+        // sana y sin consumir nada, y alguien pierde una tarde buscando por qué.
+        if (Config.COLA_CONSUMIDOR.isBlank()) {
+            System.out.println("Falta TP_COLA_CONSUMIDOR: el host:puerto gRPC de esta réplica.");
+            System.out.println("  Tiene que ser EL MISMO string que el balanceador tiene como");
+            System.out.println("  destino, porque es con lo que cruza salud y consumo.");
+            System.out.println("  ej: TP_COLA_CONSUMIDOR=100.101.15.93:8111");
+            System.exit(2);
+        }
+        if (!Config.COLA_CONSUMIDOR.matches("[^\\s/]+:\\d+")) {
+            System.out.println("[cola] aviso: TP_COLA_CONSUMIDOR=\"" + Config.COLA_CONSUMIDOR
+                    + "\" no tiene forma de host:puerto. La cola lo acepta igual, pero el"
+                    + " balanceador no va a poder cruzarlo con su registro de réplicas.");
         }
 
         RepositorioPersonas repositorio = RepositorioPersonas.crear();
         Operaciones operaciones = new Operaciones(repositorio);
         Ejecutor ejecutor = new Ejecutor(operaciones);
-        ClienteCola cola = new ClienteCola(url, Config.COLA_CONSUMIDOR);
+
+        // Una URL mal escrita se muere acá y no con una traza: TP_COLA_URLS se copia a mano
+        // en el entorno de cada casa y lleva tres URLs separadas por coma, que es
+        // exactamente donde se cuela una coma de más o un "http:/" con una sola barra.
+        ClienteCola cola;
+        try {
+            cola = new ClienteCola(url, Config.COLA_CONSUMIDOR);
+        } catch (IllegalArgumentException e) {
+            System.out.println("TP_COLA_URLS no se entiende: " + e.getMessage());
+            System.out.println("  formato: una o varias URLs separadas por coma (seed list)");
+            System.out.println("  ej: TP_COLA_URLS=http://10.0.0.1:8085,http://10.0.0.2:8085");
+            System.exit(2);
+            return;
+        }
 
         System.out.printf("Worker de cola (PID: %d) (Arrancado: %s)%n",
                 ProcessHandle.current().pid(), Config.ARRANCADO);
         System.out.printf("[instancia] %s@%s host=%s version=%d hilos=%d%n",
                 Config.APP, Config.CASA, Config.HOST, Config.VERSION, Config.COLA_HILOS);
-        System.out.println("[cola] " + cola.destino() + " como " + Config.COLA_CONSUMIDOR
-                + " (espera " + Config.COLA_ESPERA + "s)");
+        clienteCola = cola;
+        colaDestino = cola.destino();
+        System.out.println("[cola] " + colaDestino);
+        System.out.println("[cola] " + cola.cuantosNodos() + " nodo(s) · como "
+                + Config.COLA_CONSUMIDOR + " · espera " + Config.COLA_ESPERA + "s · "
+                + (Config.COLA_TOKEN.isBlank()
+                   ? "SIN token (TP_COLA_TOKEN vacío)"
+                   : "token en " + Config.COLA_AUTH));
+
+        // Se ubica el master y se compara el major del contrato ANTES de tomar el primer
+        // pedido. Un major distinto es fatal: significa que algún campo cambió de nombre o
+        // que un código cambió de significado, y seguir sería adivinar en silencio. Que el
+        // clúster no conteste todavía, en cambio, no lo es — para eso está el backoff.
+        try {
+            System.out.println("[cola] " + cola.verificar());
+        } catch (ClienteCola.ContratoIncompatible e) {
+            System.out.println("[cola] CONTRATO INCOMPATIBLE — el worker no arranca.");
+            System.out.println("  " + e.getMessage());
+            System.exit(3);
+            return;
+        }
+
         if (repositorio == null) {
             System.out.println("[personas] sin TP_REDIS_URL: las tareas de personas se responden UNAVAILABLE");
         } else {
@@ -171,6 +232,17 @@ public final class Worker {
                 espera = 0;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                break;
+            } catch (ClienteCola.ContratoIncompatible e) {
+                // El clúster puede cambiar de contrato con el worker ya corriendo (un nodo
+                // nuevo, un despliegue del otro equipo). Reintentar contra un contrato que no
+                // entendemos es peor que parar: responderíamos con campos que ya no
+                // significan lo mismo. Se para TODO el worker, no sólo este hilo, para que el
+                // orquestador lo vea caído en vez de vivo y mudo.
+                System.out.println("[cola] CONTRATO INCOMPATIBLE en caliente: " + e.getMessage());
+                System.out.println("[cola] el worker se detiene: no puede seguir respondiendo a ciegas");
+                ultimoError = e.getMessage();
+                apagando = true;
                 break;
             } catch (ClienteCola.ColaNoDisponible e) {
                 if (apagando || Thread.currentThread().isInterrupted()) {
@@ -253,9 +325,37 @@ public final class Worker {
         for (int intento = 1; intento <= REINTENTOS_RESPUESTA; intento++) {
             try {
                 ClienteCola.Entrega entrega = cola.responder(tarea, resuelta);
+
+                // Los dos 409 del contrato NO significan lo mismo, y por eso no se cuentan
+                // juntos: uno dice que la respuesta ya no hacía falta y el otro que sí hacía
+                // falta y no la pudieron recibir. Mezclarlos escondería el segundo, que es
+                // el único de los dos que indica un problema.
                 if (entrega == ClienteCola.Entrega.DESCARTADA) {
                     DESCARTADAS.incrementAndGet();
-                    System.out.println("[cola] la " + tarea + " ya no existía: otra réplica llegó primero");
+                    System.out.println("[cola] la " + tarea
+                            + " ya la había contestado otro: llegamos tarde (no es un error)");
+                    return;
+                }
+                if (entrega == ClienteCola.Entrega.SATURADO) {
+                    SATURADAS.incrementAndGet();
+                    ultimoError = "el balanceador no está recolectando la respuesta de la " + tarea;
+                    if (intento == REINTENTOS_RESPUESTA) {
+                        PERDIDAS.incrementAndGet();
+                        System.out.println("[cola] el destinatario sigue saturado después de "
+                                + intento + " intentos: se pierde la respuesta de la " + tarea);
+                        return;
+                    }
+                    // Se reintenta, pero sin apurarse: el problema está del otro lado y
+                    // volver enseguida sólo le agrega carga a quien ya no da abasto.
+                    try {
+                        Thread.sleep(espera);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        PERDIDAS.incrementAndGet();
+                        return;
+                    }
+                    espera *= 2;
+                    continue;
                 }
                 return;
             } catch (ClienteCola.ColaNoDisponible e) {
@@ -320,11 +420,20 @@ public final class Worker {
         o.addProperty("consumidor", Config.COLA_CONSUMIDOR);
         o.addProperty("hilos", Config.COLA_HILOS);
         o.addProperty("arrancado", Config.ARRANCADO);
+        o.addProperty("cola", colaDestino);
+        // Cuál de los nodos es el master ahora. Es lo primero que se quiere saber cuando el
+        // worker deja de tomar trabajo, y lo único que no se puede deducir de la config.
+        ClienteCola cliente = clienteCola;
+        o.addProperty("maestro", cliente == null ? null : cliente.maestroActual());
+        // Si el token está puesto o no, nunca cuál es: /estado no pide credencial y se mira
+        // proyectado en la demo.
+        o.addProperty("colaConToken", !Config.COLA_TOKEN.isBlank());
         o.addProperty("colaSana", colaSana);
         o.addProperty("tomadas", TOMADAS.get());
         o.addProperty("resueltas", RESUELTAS.get());
         o.addProperty("fallidas", FALLIDAS.get());
         o.addProperty("descartadas", DESCARTADAS.get());
+        o.addProperty("saturadas", SATURADAS.get());
         o.addProperty("perdidas", PERDIDAS.get());
         o.addProperty("esperasVacias", VACIAS.get());
         o.addProperty("erroresDeCola", ERRORES_COLA.get());

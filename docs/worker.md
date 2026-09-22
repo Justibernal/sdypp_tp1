@@ -4,14 +4,20 @@ Un servicio que **toma un pedido de la cola, lo resuelve y devuelve la respuesta
 mismo servicio del contrato alcanzado por otro camino: donde el servidor gRPC atiende una
 conexión, el worker va a buscar trabajo.
 
-El contrato de la cola está en [`CONTRATO.md §8`](../CONTRATO.md); la arquitectura, en los
-diagramas [8 y 9](diagramas.md).
+Lo que hay de nuestro lado está en [`CONTRATO.md §8`](../CONTRATO.md); la especificación del
+transporte la publica el equipo de colas en
+[`contrato-worker.md` v1](https://github.com/SDyPPTpGrupal/sdypp_balanceador/blob/feature/desacople/docs/contrato-worker.md),
+y lo que ve el cliente final, en el
+[contrato público](https://github.com/SDyPPTpGrupal/sdypp_balanceador/blob/feature/desacople/docs/contrato-publico.md).
+La arquitectura, en los diagramas [8 y 9](diagramas.md).
 
 ```
-                   ┌──────────── GET  ?consumidor&espera ────────────┐
-   balanceador ──▶ │  COLA  │                                        ▼
-                   │        │ ◀──────────── POST resultado ──── WORKER ──▶ Redis
-   balanceador ◀── └────────┘                                        └──▶ bitácora
+                  ┌───── POST /pedidos/tomar {consumidor, espera} ─────┐
+   balanceador ──▶│  COLA  │  (clúster: sólo el master atiende)        ▼
+                  │ master │◀──────── POST /respuestas ───────── WORKER ──▶ Redis
+   balanceador ◀──└────────┘                                        └──▶ bitácora
+                       ▲
+                  GET /health  ──  quién es el master (sin token)
 ```
 
 ---
@@ -38,10 +44,18 @@ por un camino y otro por el otro, y el contrato dejaría de valer apenas cambia 
 
 ### Con el servicio de cola del otro equipo
 
-```bash
-export CASA=casa-justino
-export TP_COLA_URL=<la-url-que-den>
+> **El paso a paso está en [`levantar-worker.md`](levantar-worker.md)**, con qué tenés que
+> ver en cada bloque y una tabla de síntomas. Este documento es el porqué; ese, el cómo.
 
+La cola y la base están en la **tailnet**, así que la máquina tiene que estar adentro antes
+que nada. `diagnostico` lo dice en cinco líneas y es lo primero que hay que correr: sin red,
+el worker levanta igual y se queda reintentando para siempre — un síntoma mucho menos claro
+que un error al arrancar.
+
+```bash
+cp deploy/.env.ejemplo .env && $EDITOR .env    # seed list, token y tu IP de Tailscale
+
+./deploy/worker.sh diagnostico    # ¿se alcanzan los nodos de cola y la base?
 ./deploy/worker.sh levantar 2     # construye y levanta 2 workers
 ./deploy/worker.sh estado         # qué hay corriendo y cuánto resolvió cada uno
 ./deploy/worker.sh escalar 4      # deja exactamente 4
@@ -49,35 +63,52 @@ export TP_COLA_URL=<la-url-que-den>
 ./deploy/worker.sh bajar
 ```
 
-### Sin él — con el doble de prueba
+**Un clúster, y un solo nodo que atiende.** `TP_COLA_URLS` es una *seed list*, no una lista de
+réplicas equivalentes: sólo el **master** atiende pedidos, y los demás contestan `421` con la
+dirección del que manda. El worker lo descubre con `GET /health`, lo cachea y le habla sólo a
+él; el caché se invalida solo con un `421` o con una conexión que se corta.
 
-Mientras la cola no esté publicada, `ar.edu.unlu.sdypp.planb.ColaFalsa` la reemplaza. **No
-es la cola del sistema**: es lo mínimo para tener contra qué hablar, con la misma semántica
-—reserva, devolución al frente, presupuesto, regla de reintento— que el módulo del otro
-equipo.
+No es un capricho de ellos: `tomar` **no es una lectura**, es una mutación —reserva el pedido
+y lo saca del pool—, así que repartirla entre nodos entregaría el mismo pedido dos veces.
+
+### Sin la cola real — con el doble de prueba
+
+`ar.edu.unlu.sdypp.planb.ColaFalsa` habla el **mismo contrato v1**: las rutas, el
+`X-Cola-Token`, el `421 no-soy-master` y los dos `409`. **No es la cola del sistema**, y sigue
+existiendo aunque la cola ya esté publicada, porque es lo único contra lo que se pueden
+provocar los casos feos a voluntad: apagar el master, tener un slave que redirige, vencer una
+reserva o declarar un contrato incompatible.
 
 ```bash
 ./mvnw -q package
+export COLA_TOKEN=secreto-local
 
-# 1) la cola falsa (dejar corriendo en una pestaña)
-MSYS_NO_PATHCONV=1 java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8000 /tareas
+# 1) el master (dejar corriendo en una pestaña)
+java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8000
 
-# 2) un worker (otra pestaña)
-TP_COLA_URL=http://localhost:8000/tareas HOST_NAME=casa-justino-worker-1 CASA=casa-justino \
-  TP_LOGS=logs/worker-1 \
+# 2) un nodo que NO es master: contesta 421 apuntando al primero. Es lo que prueba que el
+#    worker sigue el redirect en vez de tratarlo como una caída de la cola.
+COLA_FALSA_MASTER=http://localhost:8000 \
+  java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8010
+
+# 3) un worker, con el SLAVE primero en la seed list para que tenga que descubrir el master
+TP_COLA_URLS=http://localhost:8010,http://localhost:8000 \
+TP_COLA_TOKEN=$COLA_TOKEN TP_COLA_CONSUMIDOR=127.0.0.1:8300 \
+HOST_NAME=casa-justino-worker-1 CASA=casa-justino TP_LOGS=logs/worker-1 \
   java -cp target/app-java.jar ar.edu.unlu.sdypp.worker.Worker
 
-# 3) publicar tareas y recolectar las respuestas, como haría el balanceador
-MSYS_NO_PATHCONV=1 java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa \
-  publicar http://localhost:8000/tareas 40 "balanceador@casa-justino"
+# 4) publicar tareas y recolectar las respuestas, como haría el balanceador
+java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa \
+  publicar http://localhost:8000 40 "balanceador@casa-justino"
 ```
 
-Para ver el reparto, levantar un segundo worker con otro `HOST_NAME` y otro
-`TP_COLA_ADMIN`.
+Para ver el reparto, levantar un segundo worker con otro `HOST_NAME` y otro `TP_COLA_ADMIN`
+— el `TP_COLA_CONSUMIDOR` es el mismo, porque identifica a la réplica y no al proceso.
 
-> `MSYS_NO_PATHCONV=1` es para Git Bash en Windows: sin eso, MSYS convierte el argumento
-> `/tareas` en una ruta de Windows y el servidor no arranca. Es el mismo problema que ya
-> tiene documentado el volumen de la bitácora en `deploy.sh`.
+Dos variables más del doble, para provocar a voluntad casos que con el servicio real hay que
+romper algo para ver: `COLA_FALSA_MASTER` (este nodo hace de slave y contesta `421`) y
+`COLA_FALSA_COTA_RESPUESTAS` (a partir de cuántas respuestas sin recolectar empieza a
+contestar `409 destinatario-saturado`).
 
 ---
 
@@ -85,13 +116,32 @@ Para ver el reparto, levantar un segundo worker con otro `HOST_NAME` y otro
 
 | Variable | Para qué | Default |
 | :--- | :--- | :--- |
-| `TP_COLA_URL` | URL del servicio de cola. La misma para el GET y el POST. **Obligatoria** | vacío → no arranca |
-| `TP_COLA_CONSUMIDOR` | Cómo se identifica ante la cola | `java@$HOST_NAME` |
+| `TP_COLA_URLS` | **Seed list** del clúster, separada por coma. No son réplicas equivalentes: sólo el master atiende. **Obligatoria** | vacío → no arranca |
+| `TP_COLA_TOKEN` | Token de consumidor. Va en cada request salvo `/health` | vacío → no se manda ninguna |
+| `TP_COLA_CONSUMIDOR` | El `host:puerto` **gRPC** de esta réplica. **Obligatoria** — ver abajo | vacío → **no arranca** |
+| `TP_COLA_CONTRATO` | Major del contrato que implementa el worker. Si `/health` declara otro, no arranca | `1` |
+| `TP_COLA_AUTH` | Nombre del header de la credencial | `X-Cola-Token` |
+| `TP_COLA_ESQUEMA` | Prefijo del valor. Vacío manda el token pelado | vacío |
 | `TP_COLA_HILOS` | Consumidores dentro de este worker | `2` |
-| `TP_COLA_ESPERA` | Segundos que dura el long-polling del GET | `20` |
+| `TP_COLA_ESPERA` | Segundos de long-polling. Se recorta al techo de 30 que fija el contrato | `20` |
 | `TP_COLA_ADMIN` | Puerto del panel | `9091` |
-| `TP_REDIS_URL` | Base compartida. Sin ella, las tareas de personas responden `UNAVAILABLE` | vacío |
+| `TP_REDIS_URL` | Base compartida, con contraseña: `redis://:<pass>@<host>:6379/0`. Sin ella, las tareas de personas responden `UNAVAILABLE` | vacío |
 | `HOST_NAME` · `CASA` · `TP_LOGS` · `TP_GRACE` | Como en el servidor gRPC | ídem |
+
+Las seis primeras son **especificación del otro equipo**, y por eso son variables y no
+constantes: el día que la cola cambie de header o de nodos, se edita el `.env` de la casa y
+el worker levanta con lo nuevo — sin recompilar ni reconstruir la imagen.
+
+**`TP_COLA_CONSUMIDOR` no tiene default, y es a propósito.** El contrato pide el
+`host:puerto` gRPC de la réplica porque es el string con el que el balanceador la tiene
+registrada, y el que publica en su `/health` como "réplicas que están consumiendo". Un
+identificador inventado —el viejo `java@casa-justino-worker-1`, por ejemplo— deja a la
+réplica figurando **sana y sin consumir nada**, y eso no se diagnostica solo. Es preferible
+que el worker no arranque. `deploy/worker.sh` lo arma como `$TP_COLA_HOST:811n`, que son los
+puertos de las réplicas gRPC del color azul.
+
+El `.env` va en la raíz y está en `.gitignore`; `deploy/.env.ejemplo` dice qué completar.
+El token y la contraseña **no van al repo**.
 
 ## El panel
 
@@ -101,21 +151,39 @@ curl -s localhost:9101/salud     # lo que consulta el HEALTHCHECK
 ```
 
 ```json
-{"consumidor":"java@casa-justino-worker-1","hilos":2,"colaSana":true,
- "tomadas":76,"resueltas":38,"fallidas":38,"descartadas":0,"perdidas":0,
+{"consumidor":"100.101.15.93:8111","hilos":1,"colaSana":true,
+ "cola":"http://100.78.246.64:8085 · http://100.91.134.43:8085 · http://100.120.186.92:8085",
+ "maestro":"http://100.91.134.43:8085","colaConToken":true,
+ "tomadas":76,"resueltas":38,"fallidas":38,"descartadas":0,"saturadas":0,"perdidas":0,
  "porOperacion":{"CrearPersona":22,"Salud":15,"ListarPersonas":14,"Echo":12,"Identidad":12},
  "enVuelo":[],"ultimaTarea":"3947f03b · Identidad · OK"}
 ```
+
+`maestro` es el campo que más se mira cuando el worker deja de tomar trabajo: es lo único que
+no se puede deducir de la configuración. `null` quiere decir que el clúster está en elección
+o que no contesta nadie.
 
 ---
 
 ## Decisiones
 
-**El GET es de long-polling y no polling corto.** La cola implementa `tomar(consumidor,
-espera)`: el que pide trabajo se queda esperando y lo despiertan apenas hay algo. Con
-polling cada 200 ms serían cientos de requests por minuto sin trabajo, y cada pedido se
-vería con hasta 200 ms de retraso. Con una request que espera 20 s no hay ni ruido ni
-latencia.
+**`tomar` es de long-polling y no polling corto.** El que pide trabajo se queda esperando
+—hasta 30 s, que es el techo del contrato— y lo despiertan apenas hay algo. Con polling cada
+200 ms serían cientos de requests por minuto sin trabajo, y cada pedido se vería con hasta
+200 ms de retraso.
+
+**Se reintenta `responder`, nunca `tomar`.** Es la trampa que el contrato marca y que no se
+ve sola: si la conexión se corta *después* de que la request salió, no sabemos si la cola la
+procesó. Repetir un `responder` es inofensivo —el segundo vuelve con `409 desconocido`— pero
+repetir un `tomar` puede dejar **dos pedidos reservados** de los cuales sólo vimos uno. Por
+eso `tomar` sólo se repite cuando el fallo garantiza que la request no salió
+(`ConnectException`, `UnknownHostException`); un timeout no califica.
+
+**El major del contrato se verifica al arrancar, y es fatal.** `/health` declara `contrato`;
+si el major no coincide, el worker sale con código 3 en vez de operar. Responder con campos
+que ya no significan lo mismo es peor que no responder, porque no se nota. Un clúster que
+cambia de contrato con el worker ya corriendo lo para igual, y para todos los hilos, para que
+el orquestador lo vea caído en vez de vivo y mudo.
 
 **La cola caída no vuelve enfermo al worker.** `/salud` dice "el worker está trabajando", no
 "la cola responde". Un worker que se declara enfermo porque la cola está caída se hace
@@ -171,6 +239,37 @@ Desktop apagado en esa máquina).
 | ✅ | Bitácora con el sexto campo | **101 líneas, 0 fuera de formato** |
 | ✅ | **Worker muerto de golpe con una tarea en la mano** | **3000 de 3000 respondidas, 0 perdidas** |
 | ✅ | Reserva vencida → reasignación al otro worker | `reasignados: 1`, y la tarea la terminó el otro |
+| ✅ | `TP_REDIS_URL` con contraseña (`redis://:pass@host/0`) | 15/15 `OK`, las claves del §4 en la base |
+| ✅ | La contraseña no aparece en el log | `[personas] base compartida en redis://host:puerto` |
+
+Y contra el doble hablando ya el **contrato v1** — seed list con un nodo muerto, un slave y
+un master:
+
+| | Qué | Resultado |
+| :--- | :--- | :--- |
+| ✅ | Descubre el master saltando un nodo caído y preguntándole a un **slave** | `contrato 1.0 · master http://…:8000` |
+| ✅ | Token equivocado | `403 {"error":"token inválido"}`, reportado como credencial y no como caída |
+| ✅ | Ruta de datos contra un slave | `421 {"error":"no-soy-master","master":"…"}` |
+| ✅ | **El master se cae y aparece otro en distinta dirección** | Reenganchó solo: 10/10, **sin reiniciar el proceso** |
+| ✅ | Clúster entero caído, 12 s | `colaSana:false`, `maestro:null`, **4 errores** — backoff real, no bucle |
+| ✅ | `/health` declara contrato `2.0` | El worker **no arranca**: salida 3 con el motivo |
+| ✅ | Las cinco formas del `contenido` contra el contrato público | camelCase exacto, `servidoPor` incluido en `Identidad` |
+
+**El master se cae y el worker reengancha solo.** Se bajó el clúster entero, se esperó, y se
+levantó un master nuevo **en otra dirección** (el puerto que antes tenía el slave). El worker
+lo encontró recorriendo la seed list y drenó las 10 tareas sin que nadie lo tocara. Los **4
+errores en 12 segundos** son la otra mitad del resultado: es el backoff funcionando. Un bucle
+cerrado habría dado miles y la CPU al 100%, que es exactamente lo que el contrato marca como
+lo único que no se puede hacer.
+
+**Y una que falló, y valía.** En la primera corrida en contenedores el worker quedó con
+`maestro: null` y `ConnectException` aunque los dos nodos estaban vivos: el slave anunciaba
+al master como `http://127.0.0.1:8000`, y adentro del contenedor eso es el contenedor mismo.
+Era un artefacto del doble, pero el hallazgo es real y hay que decirlo en la defensa: **el
+worker va a donde el clúster le dice que vaya.** Si los nodos anuncian una dirección que no
+se resuelve desde donde corre el worker —un loopback, un nombre de red interna—, no hay nada
+que el worker pueda hacer. Es lo primero que hay que mirar si el `/health` de ellos da verde
+y el nuestro dice `maestro: null`.
 
 Y en contenedores, con Redis y las réplicas gRPC levantadas:
 
@@ -270,44 +369,37 @@ turno a una réplica aunque esté ahogada.
 
 ---
 
-## Preguntas abiertas para el equipo de la cola
 
-El módulo que pasaron (`implementacion colas.txt`) define la estructura de datos; lo que
-falta es la capa HTTP (`servidor.py`). Todo esto está **asumido** en `CONTRATO.md §8` y
-aislado en `ClienteCola.java`: confirmarlo o corregirlo no toca nada más.
+## Lo que la especificación real cambió
 
-**Las que cambian código:**
+Las siete preguntas que le habíamos dejado al equipo de colas están contestadas, y **casi
+ninguna como la habíamos supuesto**. Vale la pena que quede escrito, porque la lección no es
+"nos equivocamos": es que estaba todo aislado en un solo lugar y por eso el desfasaje costó
+un día y no una reescritura.
 
-1. **Las rutas.** ¿Confirman `GET`/`POST`/`DELETE` contra la **misma** URL? ¿Cuál es el path?
-2. **Los parámetros del GET.** ¿Se llaman `consumidor` y `espera`? ¿`espera` va en segundos?
-3. **Cola vacía.** ¿`204` sin cuerpo? El worker también acepta `200` vacío y `404`, pero
-   conviene fijar uno.
-4. **El POST del resultado.** ¿El cuerpo es `{id, estado, contenido, atendidoPor, app}`?
-   ¿Qué código devuelve al aceptar, y cuál cuando la tarea ya no existe (asumimos `409`)?
-5. **¿Exponen la devolución** (`devolver_pedido`)? Si no, el worker que se apaga no puede
-   soltar lo que no empezó y hay que esperar a que venza la reserva.
-6. **Casing del contenido.** Nosotros mandamos los nombres del `.proto` (`servido_por`).
-   ¿El balanceador los reenvía tal cual al cliente, o espera camelCase?
-7. **Autenticación**, si la hay. Va al `.env` de cada casa, no al repo.
+| Lo que asumimos (§8 v2.4) | Lo que dice el contrato v1 |
+| :--- | :--- |
+| `GET`/`POST`/`DELETE` contra la misma URL | `POST /pedidos/tomar` · `POST /respuestas` · `POST /pedidos/devolver` |
+| `consumidor` y `espera` en la query | En el cuerpo JSON |
+| `Authorization: Bearer <token>` | `X-Cola-Token: <token>` |
+| Réplicas equivalentes, rotar entre ellas | **Clúster master/slave**: rotar es un generador de `421` |
+| `409` = descartada, punto | **Dos** `409` distintos, que se distinguen por el cuerpo |
+| `2xx` al aceptar la respuesta | `202 {"resultado":"entregada"}` |
+| `consumidor` = nombre libre (`java@host`) | El `host:puerto` **gRPC** de la réplica, o no sirve |
+| `contenido` con los nombres del `.proto` (`servido_por`) | **camelCase** (`servidoPor`): es lo que se le publica al cliente |
+| `quedaMs` informativo | **Timeout obligatorio** de la operación |
+| Sin versionado | `/health` declara `contrato`, y un major distinto hay que rechazarlo |
 
-**Las que definen el comportamiento del sistema:**
+**Lo que nos salvó fue el aislamiento, no el acierto.** Todo el transporte vivía en
+`ClienteCola`, y todo lo que depende de ellos entraba por variables de entorno. Cambiar de un
+contrato al otro tocó esa clase, tres campos de `Ejecutor` y la configuración — no tocó
+`Operaciones`, ni el servidor gRPC, ni el esquema de la base, ni la bitácora. La apuesta de
+la §8 no era adivinar bien: era **acotar el costo de adivinar mal**, y eso sí salió.
 
-8. **¿Cuánto dura la reserva?** De eso depende cuánto puede tardar una tarea nuestra antes de
-   que la reasignen — y si el presupuesto (`quedaMs`) alcanza para un alta con la base lenta.
-9. **¿El `intento` que nos mandan lo podemos usar para decidir?** Por ejemplo, no repetir una
-   escritura que ya falló dos veces.
-10. **¿Qué operaciones van a encolar?** Hoy implementamos las cinco del contrato. Si va a
-    haber otras, hace falta agregarlas al catálogo de §8.4.
-11. **¿La cola es alcanzable desde las casas** (Tailscale / túnel) o sólo desde la red de
-    ustedes?
-12. **¿Nos dan un entorno de prueba** antes del día de la demo? Con un `curl` de ejemplo del
-    GET y del POST alcanza para cerrar las siete primeras.
-13. **El consumidor fantasma — la más importante de todas.** Cuando un worker se apaga con
-    sus `GET` colgados, del lado de ustedes esos consumidores siguen esperando, **uno por
-    hilo**. Si les entregan un pedido, la escritura de la respuesta va a fallar.
-    **¿Devuelven el pedido al frente cuando la escritura falla**, o queda en vuelo hasta que
-    vence la reserva? Lo medimos: un `Echo` tardó **11 segundos** con un fantasma y **más de
-    20** con dos. Y lo que de verdad importa: un `POST /personas` que caiga en un fantasma
-    **se falla con `DEADLINE_EXCEEDED` sin haberse ejecutado**, porque las escrituras no se
-    reencolan. Un alta válida le vuelve al cliente como error sólo porque alguien apagó un
-    worker. Del lado del worker no hay nada que hacer.
+**La que más duele es la rotación.** Repartir el trabajo entre los nodos estaba bien
+razonado: si son réplicas, clavarse en una desperdicia dos y concentra el riesgo. El
+razonamiento era correcto y la conclusión era incorrecta, porque faltaba un hecho del otro
+sistema: `tomar` **no es una lectura**. Reserva el pedido y lo saca del pool, así que
+repartirla entre nodos entregaría el mismo pedido dos veces. No había forma de deducirlo
+desde nuestro lado — es de esas cosas que sólo se cierran preguntando, que es exactamente
+para lo que servía la lista de preguntas abiertas.
