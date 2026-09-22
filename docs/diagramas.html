@@ -12,10 +12,10 @@
               padding: 1.2rem; margin: 1.2rem 0; text-align: center; overflow-x: auto; }
   @media print { .mermaid { page-break-inside: avoid; } }
 </style></head><body>
-<h1>Diagramas — App Java · Tarea Clase 2</h1>
-<p>Cinco diagramas: la arquitectura de cada etapa, el flujo del deploy y las dos secuencias</p>
-<p>que explican por qué el sistema aguanta. Lo que está implementado y medido va en línea</p>
-<p>llena; lo propuesto, punteado.</p>
+<h1>Diagramas — App Java</h1>
+<p>Nueve diagramas: la arquitectura de cada etapa, el flujo del deploy, las secuencias que</p>
+<p>explican por qué el sistema aguanta, y la arquitectura del <strong>worker de cola</strong> (8 y 9). Lo</p>
+<p>que está implementado y medido va en línea llena; lo propuesto, punteado.</p>
 <hr>
 <h2>1 · Arquitectura — Etapa 1: un conmutador, dos colores</h2>
 <p>Termina la pelea por el puerto: una sola URL pública, y detrás dos versiones conviviendo.</p>
@@ -282,6 +282,138 @@
 <p>compartido, <strong>50/50 exacto</strong> con canal por request.</p>
 <p>Repartir <strong>por RPC</strong> exige subir a L7 y entender HTTP/2. Es la decisión grande que le queda</p>
 <p>al equipo Plataforma.</p>
+<hr>
+<h2>8 · Arquitectura — el worker de cola</h2>
+<p>El cliente deja de esperar contra una conexión abierta: su pedido se publica en una cola y</p>
+<p>el worker que esté libre lo toma. <strong>Nadie asigna trabajo</strong> — no hay round-robin, no hay</p>
+<p>lista de backends, no hay health checks del lado del que reparte.</p>
+<pre class="mermaid">flowchart LR
+    CLI[&quot;Cliente&quot;] --&gt; BAL
+
+    BAL[&quot;BALANCEADOR&lt;br/&gt;publica el pedido&lt;br/&gt;recolecta la respuesta&quot;]
+
+    subgraph COLA [&quot;SERVICIO DE COLA — otro equipo&quot;]
+        PED[[&quot;pedidos&lt;br/&gt;FIFO · reserva por consumidor&lt;br/&gt;presupuesto por pedido&quot;]]
+        RES[[&quot;respuestas&lt;br/&gt;indexadas por destinatario&quot;]]
+        REC[&quot;recuperador&lt;br/&gt;reserva vencida:&lt;br/&gt;idempotente → reencola&lt;br/&gt;escritura → DEADLINE_EXCEEDED&quot;]
+    end
+
+    BAL --&gt;|&quot;publicar&quot;| PED
+    RES --&gt;|&quot;recolectar&quot;| BAL
+    PED -.-&gt; REC
+    REC -.-&gt;|&quot;el que nadie contestó&quot;| RES
+
+    subgraph CJ [&quot;casa-justino&quot;]
+        W1[&quot;WORKER&lt;br/&gt;2 consumidores&lt;br/&gt;panel :9101&quot;]
+        L1[&quot;bitácora&lt;br/&gt;… | CrearPersona | OK | id=7 | tarea=a3f9&quot;]
+    end
+
+    subgraph CA [&quot;casa-agustina&quot;]
+        W2[&quot;WORKER&lt;br/&gt;2 consumidores&lt;br/&gt;panel :9102&quot;]
+        L2[&quot;bitácora&quot;]
+    end
+
+    PED ==&gt;|&quot;GET ?consumidor&amp;espera&lt;br/&gt;long-polling · reserva&quot;| W1
+    PED ==&gt; W2
+    W1 ==&gt;|&quot;POST id · estado · contenido&quot;| RES
+    W2 ==&gt; RES
+
+    W1 --&gt; L1
+    W2 --&gt; L2
+
+    REDIS[(&quot;Redis&lt;br/&gt;estado compartido&quot;)]
+    W1 --&gt; REDIS
+    W2 --&gt; REDIS
+
+    subgraph GRPC [&quot;el otro camino, que sigue existiendo&quot;]
+        REP[&quot;réplicas gRPC&lt;br/&gt;:8121 · :8122&quot;]
+    end
+    REP --&gt; REDIS
+
+    OPS[&quot;Operaciones&lt;br/&gt;validación y orden del contrato §3&lt;br/&gt;&lt;b&gt;una sola implementación&lt;/b&gt;&quot;]
+    W1 -.-&gt; OPS
+    W2 -.-&gt; OPS
+    REP -.-&gt; OPS
+
+    classDef java fill:#1f6feb,stroke:#0b3d91,color:#fff
+    classDef cola fill:#8957e5,stroke:#4c2889,color:#fff
+    classDef infra fill:#6e7681,stroke:#30363d,color:#fff
+    classDef log fill:#9e6a03,stroke:#5c3d00,color:#fff
+    classDef compartido fill:#2ea043,stroke:#12511f,color:#fff
+    class W1,W2,REP java
+    class PED,RES,REC,BAL cola
+    class REDIS infra
+    class L1,L2 log
+    class OPS compartido
+</pre>
+<p><strong>Tres cosas que cambian respecto del balanceador de la Etapa 2:</strong></p>
+<p>| | Balanceador (Etapa 2) | Cola (Etapa 4) |</p>
+<p>| :--- | :--- | :--- |</p>
+<p>| Quién elige | El balanceador, por turno | <strong>El worker libre</strong>, pidiendo trabajo |</p>
+<p>| Un worker lento | Recibe igual: le toca por round-robin | Toma menos, porque pide menos |</p>
+<p>| Un worker muerto | Hay que detectarlo con health checks | No hace falta: <strong>le vence la reserva</strong> y otro lo toma |</p>
+<p><strong>El worker no escucha ningún puerto de servicio.</strong> Nadie le habla: es él quien va a buscar</p>
+<p>trabajo. Por eso se despliega en cualquier casa sin pedirle al equipo de red una IP</p>
+<p>alcanzable ni un puerto abierto — sólo necesita *alcanzar* la cola. Lo único que expone es</p>
+<p>un panel de sólo lectura para el <code>HEALTHCHECK</code> y para mirarlo en la demo.</p>
+<p><strong>Una sola implementación del contrato.</strong> El worker y las réplicas gRPC resuelven con la</p>
+<p>misma clase <code>Operaciones</code>. Si cada uno validara por su cuenta, la misma alta daría</p>
+<p><code>INVALID_ARGUMENT</code> por un camino y <code>ALREADY_EXISTS</code> por el otro, y el contrato dejaría de</p>
+<p>valer apenas cambia el transporte.</p>
+<hr>
+<h2>9 · Secuencia — el ciclo de una tarea, y los dos casos feos</h2>
+<pre class="mermaid">sequenceDiagram
+    autonumber
+    participant B as Balanceador
+    participant Q as Cola
+    participant W1 as Worker 1
+    participant W2 as Worker 2
+    participant DB as Redis
+
+    Note over W1,W2: los dos están esperando trabajo (long-polling)
+    W1-&gt;&gt;Q: GET ?consumidor=w1&amp;espera=20
+    W2-&gt;&gt;Q: GET ?consumidor=w2&amp;espera=20
+
+    B-&gt;&gt;Q: publicar · POST /personas · id a3f9
+    Q--&gt;&gt;W1: a3f9 · quedaMs 4200 · idempotente false
+    Note over Q: reservado por w1 · 10 s
+
+    W1-&gt;&gt;DB: script Lua atómico
+    DB--&gt;&gt;W1: id = 7
+    W1-&gt;&gt;W1: bitácora · CrearPersona | OK | id=7 | tarea=a3f9
+    W1-&gt;&gt;Q: POST a3f9 · OK · {persona}
+    Q--&gt;&gt;B: respuesta de a3f9
+    B--&gt;&gt;B: se la devuelve al cliente
+
+    rect rgba(218, 54, 51, .12)
+        Note over W2,Q: caso feo 1 — el worker se muere con la tarea en la mano
+        B-&gt;&gt;Q: publicar · GET /personas · id b7c1 (idempotente)
+        Q--&gt;&gt;W2: b7c1
+        Note over W2: el worker se cae
+        Note over Q: vence la reserva a los 10 s
+        Q-&gt;&gt;Q: idempotente → vuelve AL FRENTE
+        Q--&gt;&gt;W1: b7c1 · intento 1
+        W1-&gt;&gt;Q: POST b7c1 · OK
+    end
+
+    rect rgba(210, 153, 34, .15)
+        Note over W1,Q: caso feo 2 — la respuesta que llega segunda
+        Note over W1: w1 tardó más que la reserva, pero contestó igual
+        W1-&gt;&gt;Q: POST b7c1 · OK (otra vez)
+        Q--&gt;&gt;W1: 409 · desconocido
+        Note over W1: no se reintenta: gana la primera respuesta
+    end
+</pre>
+<p><strong>Por qué una escritura no se reencola.</strong> Al vencer una reserva, la cola sabe que el worker</p>
+<p>no contestó — pero no sabe si llegó a ejecutar. Repetir una lectura no cuesta nada; repetir</p>
+<p>un alta puede crear la persona dos veces. Por eso lo idempotente vuelve al frente y la</p>
+<p>escritura se falla con <code>DEADLINE_EXCEEDED</code>: un error honesto es mejor que un duplicado</p>
+<p>silencioso. Es la misma decisión que el <code>legajo</code> único protege del lado de Redis, ahora un</p>
+<p>nivel más arriba.</p>
+<p><strong>Por qué el worker reintenta la respuesta y no la ejecución.</strong> Cuando el POST falla, la</p>
+<p>tarea <strong>ya se ejecutó</strong>: si el alta se escribió en la base y la respuesta se pierde, el</p>
+<p>cliente recibe un error por algo que sí pasó, y como la cola no reintenta las escrituras,</p>
+<p>nadie lo corrige después. Reintentar la ejecución, en cambio, duplicaría el trabajo.</p>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
 <script>mermaid.initialize({ startOnLoad: true, theme: 'default',
   flowchart: { curve: 'basis', useMaxWidth: true } });</script>

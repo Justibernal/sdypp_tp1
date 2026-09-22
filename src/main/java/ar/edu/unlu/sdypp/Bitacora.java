@@ -38,16 +38,29 @@ public final class Bitacora {
         registrar(rpc, codigo, null);
     }
 
+    public static void registrar(String rpc, String codigo, Integer id) {
+        registrar(rpc, codigo, id, null);
+    }
+
     /**
      * Formato de CONTRATO.md §5, campo por campo:
      * {@code 2026-09-08T14:03:22-03:00 | java@casa-agustina | CrearPersona | OK | id=7}
+     *
+     * <p>El {@code extra} es un sexto campo opcional, y hoy lo usa sólo el worker para
+     * anotar {@code tarea=<id>}. Los cinco campos del contrato quedan intactos y en el mismo
+     * orden —lo que sigue funcionando para el que corta por columnas— pero la línea del
+     * worker lleva además el id que le dio la cola: es el <b>id de correlación</b> que el
+     * contrato no tiene y que la auditoría necesita para cruzar dos bitácoras sin depender
+     * de que los relojes de dos casas coincidan. Es la mejora nº2 que le levantamos al
+     * enunciado, resuelta acá porque la cola nos dio el id que faltaba.
      */
-    public static void registrar(String rpc, String codigo, Integer id) {
+    public static void registrar(String rpc, String codigo, Integer id, String extra) {
         String linea = Config.ahoraIso()
                 + " | " + Config.APP + "@" + Config.CASA
                 + " | " + rpc
                 + " | " + codigo
-                + " | " + (id != null ? "id=" + id : "-");
+                + " | " + (id != null ? "id=" + id : "-")
+                + (extra != null ? " | " + extra : "");
         try {
             synchronized (CANDADO) {
                 if (ARCHIVO.getParent() != null) {

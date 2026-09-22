@@ -16,6 +16,7 @@
     <grpc.version>1.84.0</grpc.version>
     <protobuf.version>4.36.1</protobuf.version>
     <jedis.version>7.5.3</jedis.version>
+    <gson.version>2.13.2</gson.version>
   </properties>
 
   <dependencyManagement>
@@ -57,6 +58,16 @@
       <groupId>redis.clients</groupId>
       <artifactId>jedis</artifactId>
       <version>${jedis.version}</version>
+    </dependency>
+
+    <!-- Gson: el sobre de la cola viaja en JSON y el worker lo lee y lo arma. Se declara
+         explicito aunque Jedis ya lo arrastre: depender de una transitiva es depender de que
+         otro no cambie de opinion. Misma version que la que pinnea Jedis, para no terminar
+         con dos gson distintos en el classpath. -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+      <version>${gson.version}</version>
     </dependency>
 
     <!-- slf4j-api explícito: Jedis arrastra la 1.7.36 y slf4j-simple es 2.x. Con las

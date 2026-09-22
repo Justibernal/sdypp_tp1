@@ -1,0 +1,45 @@
+# ── Etapa 1: build ────────────────────────────────────────────────────────────
+# Idéntico al del servicio, y a propósito: el worker y las réplicas salen del MISMO jar.
+# Si se construyeran por separado podrían terminar corriendo versiones distintas del
+# contrato — la misma alta daría un código por gRPC y otro por la cola, que es exactamente
+# lo que el contrato existe para impedir.
+FROM maven:3.9-eclipse-temurin-17 AS build
+WORKDIR /build
+
+COPY pom.xml .
+RUN mvn -B -q dependency:go-offline
+
+COPY src ./src
+RUN mvn -B -q package -DskipTests
+
+# ── Etapa 2: runtime ──────────────────────────────────────────────────────────
+FROM eclipse-temurin:17-jre
+
+# Usuario no-root (CONTRATO.md §6).
+RUN useradd --create-home --uid 10001 app
+WORKDIR /app
+
+COPY --from=build /build/target/app-java.jar /app/app-java.jar
+
+RUN mkdir -p /app/logs && chown -R app:app /app
+USER app
+
+ENV TP_LOGS=/app/logs TP_COLA_ADMIN=9091
+
+# El worker NO expone un puerto de servicio: nadie le habla, es él quien va a buscar
+# trabajo. Lo único que escucha es el panel de sólo lectura, para el HEALTHCHECK y para
+# mirarlo durante la demo. Eso es lo que lo hace desplegable en cualquier casa sin pedirle
+# un puerto abierto ni una IP alcanzable al equipo de red.
+EXPOSE 9091
+
+# Contra su propio panel: no hay gRPC que consultar. "El proceso vive" no alcanza — un
+# worker con los consumidores muertos por una excepción sigue teniendo el proceso arriba y
+# no toma un pedido más.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["java", "-XX:TieredStopAtLevel=1", "-Xmx64m", "-cp", "/app/app-java.jar", \
+       "ar.edu.unlu.sdypp.worker.Healthcheck"]
+
+# Forma exec: el PID 1 es la JVM y recibe el SIGTERM de `docker stop` directamente. Sin
+# eso el worker moriría de golpe con una tarea en la mano, y esa tarea se quedaría en vuelo
+# hasta que a la cola le venciera la reserva.
+ENTRYPOINT ["java", "-cp", "/app/app-java.jar", "ar.edu.unlu.sdypp.worker.Worker"]
