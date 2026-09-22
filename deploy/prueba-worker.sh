@@ -3,7 +3,7 @@
 # Prueba de punta a punta del worker de cola. Se corre entera y dice qué tiene que verse.
 #
 #   ./deploy/prueba-worker.sh            contra el doble de prueba (no hace falta el otro equipo)
-#   TP_COLA_URL=<url> ./deploy/prueba-worker.sh   contra el servicio de cola real
+#   TP_COLA_URLS=<url> ./deploy/prueba-worker.sh   contra el servicio de cola real
 #   ./deploy/prueba-worker.sh limpiar    baja todo lo que levanta
 #
 # Cubre lo que el worker tiene que sostener: el alta real contra Redis, el legajo repetido,
@@ -28,11 +28,11 @@ mal()  { printf '\033[1;31m[ FALLA]\033[0m %s\n' "$*"; FALLAS=$((FALLAS+1)); }
 FALLAS=0
 
 publicar() {
-  curl -s -X POST "http://localhost:$PUERTO_COLA/tareas/publicar" \
+  curl -s -X POST "http://localhost:$PUERTO_COLA/publicar" \
     -H 'Content-Type: application/json' -d "$1" > /dev/null
 }
 respuesta() {
-  curl -s "http://localhost:$PUERTO_COLA/tareas/respuestas?destinatario=balanceador%40prueba&espera=20"
+  curl -s "http://localhost:$PUERTO_COLA/recolectar?destinatario=balanceador%40prueba&espera=20"
 }
 # Comprueba que la respuesta traiga lo esperado, y la muestra.
 esperar() {  # <que se espera> <patron> <respuesta>
@@ -60,17 +60,17 @@ docker ps --format '{{.Names}}' | grep -qx "$REDIS" || \
 log "redis: $(docker inspect --format '{{.State.Status}}' "$REDIS")"
 
 # --- 1. la cola ---------------------------------------------------------------
-if [ -z "${TP_COLA_URL:-}" ]; then
-  log "sin TP_COLA_URL: se levanta el doble de prueba en :$PUERTO_COLA"
-  MSYS_NO_PATHCONV=1 java -cp "$JAR" ar.edu.unlu.sdypp.planb.ColaFalsa "$PUERTO_COLA" /tareas \
+if [ -z "${TP_COLA_URLS:-}" ]; then
+  log "sin TP_COLA_URLS: se levanta el doble de prueba en :$PUERTO_COLA"
+  MSYS_NO_PATHCONV=1 java -cp "$JAR" ar.edu.unlu.sdypp.planb.ColaFalsa "$PUERTO_COLA" \
     > logs/cola-falsa.log 2>&1 &
   sleep 3
   curl -s "localhost:$PUERTO_COLA/estado" > /dev/null || { mal "la cola no arrancó"; exit 1; }
   ok "cola de prueba arriba"
   # El worker corre en un contenedor: para él, el host es host.docker.internal
-  export TP_COLA_URL="http://host.docker.internal:$PUERTO_COLA/tareas"
+  export TP_COLA_URLS="http://host.docker.internal:$PUERTO_COLA"
 else
-  log "usando la cola real: $TP_COLA_URL"
+  log "usando la cola real: $TP_COLA_URLS"
 fi
 
 # --- 2. una réplica gRPC, para probar el cruce entre los dos caminos ----------
@@ -90,6 +90,13 @@ log "réplica gRPC en :$PUERTO_GRPC"
 
 # --- 3. los workers -----------------------------------------------------------
 export CASA
+# La base de ESTA prueba es el contenedor local, no la compartida del TP: la prueba crea y
+# borra personas, y hacerlo contra la base del grupo le ensuciaría el listado a todos.
+export TP_REDIS_URL="${TP_REDIS_URL:-redis://$REDIS:6379/0}"
+# El consumidor tiene que tener forma de host:puerto, que es lo que el contrato pide. Acá no
+# hay un balanceador que lo cruce con nada, así que alcanza con que sea estable y distinto
+# por worker.
+export TP_COLA_HOST="${TP_COLA_HOST:-127.0.0.1}"
 sh deploy/worker.sh levantar 2 || { mal "no se pudieron levantar los workers"; exit 1; }
 
 # --- 4. las pruebas -----------------------------------------------------------

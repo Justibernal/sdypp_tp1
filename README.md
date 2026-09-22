@@ -141,16 +141,22 @@ escala solo y **no escucha ningún puerto de servicio** — nadie le habla, es �
 buscar trabajo.
 
 ```bash
-export TP_COLA_URL=<la-url-de-la-cola>
+cp deploy/.env.ejemplo .env && $EDITOR .env    # seed list, token y tu IP de Tailscale
+./deploy/worker.sh diagnostico    # ¿se alcanzan los nodos de cola y la base?
 ./deploy/worker.sh levantar 2     # construye y levanta 2 workers
 ./deploy/worker.sh estado         # cuánto resolvió cada uno
 ./deploy/worker.sh escalar 4      # agregar capacidad: no se toca ni la cola ni el balanceador
 ```
 
-Mientras la cola del otro equipo no esté publicada, `planb.ColaFalsa` la reemplaza para
-poder probar y demostrar. Todo —cómo levantarlo, las decisiones, lo verificado y las
-preguntas abiertas— está en **[`docs/worker.md`](docs/worker.md)**; el contrato de la cola,
-en [`CONTRATO.md §8`](CONTRATO.md).
+**El paso a paso completo, de cero a atendiendo pedidos, está en
+[`docs/levantar-worker.md`](docs/levantar-worker.md)** — es lo que hay que seguir para
+sumar una casa. El porqué de cada decisión, lo verificado y el detalle del protocolo, en
+[`docs/worker.md`](docs/worker.md); lo que toca de nuestro contrato, en
+[`CONTRATO.md §8`](CONTRATO.md).
+
+`planb.ColaFalsa` es un doble de la cola que habla el mismo contrato v1. Ya no hace falta
+para desarrollar —la cola está publicada— pero sigue siendo la única forma de provocar a
+voluntad los casos feos: apagar el master, un slave que redirige, una reserva que vence.
 
 La línea de bitácora del worker lleva un sexto campo, `tarea=<id>`: es el **id de
 correlación** que faltaba para auditar sin depender de que los relojes de dos casas
@@ -177,8 +183,13 @@ $V secuencia    localhost:8102 999500    # un alta y la lectura siguiente
 | `TP_REDIS_URL` | Base compartida. **Lleva la contraseña: no se versiona.** | vacío → personas da `UNAVAILABLE` |
 | `TP_WORKERS` | Hilos que atienden RPCs a la vez. | `10` |
 | `TP_LOGS` | Directorio de la bitácora. | `logs` |
-| `TP_COLA_URL` | URL del servicio de cola. La misma para el GET y el POST. Sólo la usa el worker. | vacío |
-| `TP_COLA_HILOS` · `TP_COLA_ESPERA` · `TP_COLA_ADMIN` · `TP_COLA_CONSUMIDOR` | Del worker. Ver [`docs/worker.md`](docs/worker.md). | `2` · `20` · `9091` · `java@$HOST_NAME` |
+| `TP_COLA_URLS` | Seed list del clúster de colas, separada por coma. Sólo la usa el worker. | vacío |
+| `TP_COLA_TOKEN` | Token de consumidor, en el header `X-Cola-Token`. **No se versiona.** | vacío |
+| `TP_COLA_CONSUMIDOR` | El `host:puerto` gRPC de esta réplica. **Sin default: el worker no arranca sin esto.** | vacío |
+| `TP_COLA_HILOS` · `TP_COLA_ESPERA` · `TP_COLA_ADMIN` · `TP_COLA_CONTRATO` | Del worker. Ver [`docs/worker.md`](docs/worker.md). | `2` · `20` · `9091` · `1` |
+
+Las del worker salen de un `.env` en la raíz, que está en `.gitignore`:
+`deploy/.env.ejemplo` dice qué completar.
 
 ---
 

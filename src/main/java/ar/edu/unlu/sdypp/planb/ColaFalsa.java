@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
@@ -36,20 +37,29 @@ import java.util.concurrent.TimeUnit;
  * respuesta que llega segunda, la cola que se cae— que con el servicio real no se pueden
  * provocar a voluntad.
  *
- * <p>Implementa la misma semántica que el módulo de colas del otro equipo, que es lo único
- * que lo hace útil: FIFO con <b>reserva</b>, devolución al frente, presupuesto por pedido, y
- * la regla de reintento — al vencer una reserva, lo idempotente se reencola y la escritura
- * se falla con {@code DEADLINE_EXCEEDED}, porque "no contestó" no dice si alcanzó a
- * ejecutarse.
+ * <p>Habla el <b>contrato real</b> del equipo de colas ({@code contrato-worker.md v1}): las
+ * rutas, el header {@code X-Cola-Token}, el {@code 421 no-soy-master} y los dos {@code 409}
+ * que se distinguen por el cuerpo. Y además implementa la misma semántica de cola: FIFO con
+ * <b>reserva</b>, devolución al frente, presupuesto por pedido, y la regla de reintento — al
+ * vencer una reserva, lo idempotente se reencola y la escritura se falla con
+ * {@code DEADLINE_EXCEEDED}, porque "no contestó" no dice si alcanzó a ejecutarse.
+ *
+ * <p>Lo que el servicio real <b>no</b> deja hacer, y este sí, es provocar los casos feos a
+ * voluntad: apagar el master, tener un slave que redirige, vencer una reserva, o declarar un
+ * contrato incompatible. Por eso existe incluso ahora que la cola está publicada.
  *
  * <pre>
- *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8000 /tareas
+ *   # un master
+ *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8000
+ *
+ *   # un slave que redirige al master de arriba (para probar el 421)
+ *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa 8001 slave http://127.0.0.1:8000
  *
  *   # publicar tareas, como haría el balanceador
- *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa publicar http://localhost:8000/tareas 20
+ *   java -cp target/app-java.jar ar.edu.unlu.sdypp.planb.ColaFalsa publicar http://localhost:8000 20
  *
+ *   curl -s localhost:8000/health
  *   curl -s localhost:8000/estado
- *   curl -s "localhost:8000/tareas/respuestas?destinatario=balanceador@casa-justino&espera=5"
  * </pre>
  */
 public final class ColaFalsa {
@@ -100,6 +110,22 @@ public final class ColaFalsa {
     private static long respondidos = 0;
     private static long descartados = 0;
 
+    /**
+     * Versión de contrato que declara este doble en /health. La misma que la cola real, y
+     * cambiable por entorno para poder probar que el worker se planta ante un major distinto.
+     */
+    private static final String CONTRATO =
+            System.getenv().getOrDefault("TP_COLA_CONTRATO_FALSO", "1.0");
+
+    /** "master" o "slave". Un slave contesta 421 en las tres rutas de datos. */
+    private static volatile String rol = "master";
+
+    /** Lo que este nodo cree que es el master. Vacío simula una elección en curso. */
+    private static volatile String masterConocido = "";
+
+    /** Si no está vacío, se exige en el header X-Cola-Token. */
+    private static volatile String token = "";
+
     private ColaFalsa() {
     }
 
@@ -110,7 +136,11 @@ public final class ColaFalsa {
         }
 
         int puerto = args.length > 0 ? Integer.parseInt(args[0]) : 8000;
-        String ruta = args.length > 1 ? args[1] : "/tareas";
+        // Rol y master conocido: con esto un segundo proceso hace de slave y contesta 421,
+        // que es la única forma de probar el redescubrimiento sin tener el clúster real.
+        rol = args.length > 1 ? args[1] : "master";
+        masterConocido = args.length > 2 ? args[2] : ("http://127.0.0.1:" + puerto);
+        token = System.getenv().getOrDefault("TP_COLA_TOKEN", "");
 
         HttpServer servidor = HttpServer.create(new InetSocketAddress(puerto), 0);
         // Pool y no el executor por defecto (que atiende de a uno): los GET del worker son
@@ -119,9 +149,16 @@ public final class ColaFalsa {
         // cola se trabaría sola.
         servidor.setExecutor(Executors.newFixedThreadPool(16));
 
-        servidor.createContext(ruta + "/publicar", ColaFalsa::publicarHandler);
-        servidor.createContext(ruta + "/respuestas", ColaFalsa::respuestasHandler);
-        servidor.createContext(ruta, ColaFalsa::tareasHandler);
+        // Las rutas del worker, tal como las define contrato-worker.md v1.
+        servidor.createContext("/pedidos/tomar", soloMaster(ColaFalsa::tomar));
+        servidor.createContext("/pedidos/devolver", soloMaster(ColaFalsa::soltar));
+        servidor.createContext("/respuestas", soloMaster(ColaFalsa::recibirRespuesta));
+        servidor.createContext("/health", ColaFalsa::saludHandler);
+
+        // Las del rol balanceador. No son del contrato del worker: son lo que necesita este
+        // doble para que alguien publique pedidos y recolecte respuestas.
+        servidor.createContext("/publicar", ColaFalsa::publicarHandler);
+        servidor.createContext("/recolectar", ColaFalsa::respuestasHandler);
         servidor.createContext("/estado", intercambio -> responder(intercambio, 200, estado()));
         servidor.start();
 
@@ -133,38 +170,82 @@ public final class ColaFalsa {
             return t;
         }).scheduleWithFixedDelay(ColaFalsa::recuperar, 1, 1, TimeUnit.SECONDS);
 
-        System.out.println("Cola (PLAN B — doble de prueba) en 0.0.0.0:" + puerto + ruta);
-        System.out.println("  GET    " + ruta + "?consumidor=<id>&espera=<s>   tomar un pedido");
-        System.out.println("  POST   " + ruta + "                              devolver la respuesta");
-        System.out.println("  DELETE " + ruta + "?id=<id>&consumidor=<id>      soltar un pedido");
-        System.out.println("  POST   " + ruta + "/publicar                     publicar (rol balanceador)");
-        System.out.println("  GET    " + ruta + "/respuestas?destinatario=<d>  recolectar (rol balanceador)");
-        System.out.println("  GET    /estado");
+        System.out.println("Cola (PLAN B — doble de prueba) en 0.0.0.0:" + puerto
+                + "  ·  rol: " + rol + "  ·  contrato " + CONTRATO
+                + (token.isEmpty() ? "  ·  sin token" : "  ·  con token"));
+        System.out.println("  POST /pedidos/tomar      {consumidor, espera}   tomar un pedido");
+        System.out.println("  POST /respuestas         {id, estado, ...}      devolver la respuesta");
+        System.out.println("  POST /pedidos/devolver   {id, consumidor}       soltar un pedido");
+        System.out.println("  GET  /health                                    quién es el master");
+        System.out.println("  POST /publicar                                  publicar (rol balanceador)");
+        System.out.println("  GET  /recolectar?destinatario=<d>               recolectar (rol balanceador)");
+        System.out.println("  GET  /estado");
     }
 
-    // --- el endpoint del worker --------------------------------------------------------
+    // --- las rutas del worker ----------------------------------------------------------
 
-    private static void tareasHandler(HttpExchange intercambio) throws IOException {
-        switch (intercambio.getRequestMethod()) {
-            case "GET":
-                tomar(intercambio);
+    /**
+     * Envuelve una ruta de datos con las dos cosas que el contrato pone delante de todas:
+     * el token de consumidor y el {@code 421} si este nodo no es el master.
+     *
+     * <p>Que el 421 salga de acá y no de cada handler es a propósito: es lo que garantiza
+     * que las tres rutas se comporten igual. Una sola que se olvidara de redirigir le
+     * entregaría trabajo desde un slave, y el bug aparecería recién con el clúster real.
+     */
+    private static HttpHandler soloMaster(HttpHandler siguiente) {
+        return intercambio -> {
+            if (!token.isEmpty() && !token.equals(intercambio.getRequestHeaders().getFirst("X-Cola-Token"))) {
+                responder(intercambio, 403, "{\"error\":\"token inválido\"}");
                 return;
-            case "POST":
-                recibirRespuesta(intercambio);
+            }
+            if (!"master".equals(rol)) {
+                JsonObject o = new JsonObject();
+                o.addProperty("error", "no-soy-master");
+                if (masterConocido == null || masterConocido.isBlank()) {
+                    o.add("master", com.google.gson.JsonNull.INSTANCE);
+                } else {
+                    o.addProperty("master", masterConocido);
+                }
+                responder(intercambio, 421, o.toString());
                 return;
-            case "DELETE":
-                soltar(intercambio);
-                return;
-            default:
+            }
+            if (!"POST".equals(intercambio.getRequestMethod())) {
                 responder(intercambio, 405, "{\"error\":\"método no permitido\"}");
-        }
+                return;
+            }
+            siguiente.handle(intercambio);
+        };
     }
 
-    /** GET: entrega el próximo pedido y lo reserva. 204 si no hubo nada en `espera`. */
+    /** {@code GET /health}: descubrimiento y diagnóstico. No lleva token. */
+    private static void saludHandler(HttpExchange intercambio) throws IOException {
+        JsonObject o = new JsonObject();
+        o.addProperty("cola", "sana");
+        o.addProperty("rol", rol);
+        o.addProperty("termino", 1);
+        if (masterConocido == null || masterConocido.isBlank()) {
+            o.add("masterConocido", com.google.gson.JsonNull.INSTANCE);
+        } else {
+            o.addProperty("masterConocido", masterConocido);
+        }
+        o.addProperty("contrato", CONTRATO);
+        o.addProperty("instancia", "cola-falsa@" + rol);
+        synchronized (CANDADO) {
+            o.addProperty("esperando", ESPERANDO.size());
+            o.addProperty("enVuelo", EN_VUELO.size());
+        }
+        o.addProperty("cota", 1000);
+        responder(intercambio, 200, o.toString());
+    }
+
+    /** {@code POST /pedidos/tomar}: entrega el próximo pedido y lo reserva. 204 si no hubo nada. */
     private static void tomar(HttpExchange intercambio) throws IOException {
-        Map<String, String> parametros = consulta(intercambio);
-        String consumidor = parametros.getOrDefault("consumidor", "anónimo");
-        long limite = ahora() + entero(parametros.get("espera"), 20) * 1000;
+        JsonObject pedidoJson = cuerpoJson(intercambio);
+        String consumidor = texto(pedidoJson == null ? new JsonObject() : pedidoJson,
+                "consumidor", "anónimo");
+        long espera = pedidoJson != null && pedidoJson.has("espera")
+                ? pedidoJson.get("espera").getAsLong() : 20;
+        long limite = ahora() + espera * 1000;
 
         // Se arma la respuesta adentro del candado y se escribe afuera: un cliente lento
         // escribiendo su respuesta no tiene por qué frenar al que viene a publicar.
@@ -200,7 +281,10 @@ public final class ColaFalsa {
         }
     }
 
-    /** POST: el worker contestó. 409 si ese pedido ya no existe (llegó segundo). */
+    /**
+     * {@code POST /respuestas}: el worker contestó. {@code 202} si se aceptó,
+     * {@code 409 desconocido} si ese pedido ya no existe (llegó segundo).
+     */
     private static void recibirRespuesta(HttpExchange intercambio) throws IOException {
         JsonObject cuerpo = cuerpoJson(intercambio);
         if (cuerpo == null || !cuerpo.has("id")) {
@@ -213,7 +297,7 @@ public final class ColaFalsa {
             Pedido pedido = completar(id);
             if (pedido == null) {
                 descartados++;
-                responder(intercambio, 409, "{\"error\":\"desconocido\"}");
+                responder(intercambio, 409, "{\"resultado\":\"desconocido\"}");
                 return;
             }
             respondidos++;
@@ -226,17 +310,20 @@ public final class ColaFalsa {
             RESPUESTAS.computeIfAbsent(pedido.destinatario, k -> new ArrayDeque<>()).add(respuesta);
             CANDADO.notifyAll();
         }
-        responder(intercambio, 200, "{\"entregada\":true}");
+        responder(intercambio, 202, "{\"resultado\":\"entregada\"}");
     }
 
-    /** DELETE: el worker suelta un pedido sin resolver. Vuelve al frente: ya esperó una vez. */
+    /**
+     * {@code POST /pedidos/devolver}: el worker suelta un pedido sin atenderlo. Vuelve al
+     * frente, que ya esperó una vez. {@code 409 no-estaba-en-vuelo} si la reserva ya venció.
+     */
     private static void soltar(HttpExchange intercambio) throws IOException {
-        Map<String, String> parametros = consulta(intercambio);
-        String id = parametros.get("id");
+        JsonObject cuerpo = cuerpoJson(intercambio);
+        String id = cuerpo == null ? null : texto(cuerpo, "id", null);
         synchronized (CANDADO) {
             Pedido pedido = id == null ? null : EN_VUELO.remove(id);
             if (pedido == null) {
-                responder(intercambio, 404, "{\"error\":\"no estaba en vuelo\"}");
+                responder(intercambio, 409, "{\"resultado\":\"no-estaba-en-vuelo\"}");
                 return;
             }
             pedido.reservadoPor = null;
@@ -244,7 +331,7 @@ public final class ColaFalsa {
             ESPERANDO.addFirst(pedido);
             CANDADO.notifyAll();
         }
-        responder(intercambio, 200, "{\"devuelto\":true}");
+        responder(intercambio, 200, "{\"resultado\":\"devuelto\"}");
     }
 
     // --- los endpoints del rol balanceador ---------------------------------------------
@@ -363,7 +450,7 @@ public final class ColaFalsa {
     // --- el modo cliente: publicar tareas como lo haría el balanceador -----------------
 
     private static void publicar(String[] args) throws Exception {
-        String url = args.length > 1 ? args[1] : "http://localhost:8000/tareas";
+        String url = args.length > 1 ? args[1] : "http://localhost:8000";
         int cuantas = args.length > 2 ? Integer.parseInt(args[2]) : 10;
         String destinatario = args.length > 3 ? args[3] : "balanceador@local";
         long base = System.currentTimeMillis() % 100000;
@@ -420,7 +507,7 @@ public final class ColaFalsa {
         Map<String, Integer> porWorker = new HashMap<>();
         while (recolectadas < publicadas) {
             HttpResponse<String> respuesta = http.send(HttpRequest.newBuilder()
-                            .uri(URI.create(url + "/respuestas?destinatario="
+                            .uri(URI.create(url + "/recolectar?destinatario="
                                     + java.net.URLEncoder.encode(destinatario, StandardCharsets.UTF_8) + "&espera=10"))
                             .timeout(Duration.ofSeconds(15))
                             .GET().build(),

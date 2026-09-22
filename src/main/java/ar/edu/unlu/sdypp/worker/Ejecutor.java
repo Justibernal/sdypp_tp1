@@ -10,6 +10,14 @@ import com.google.gson.JsonPrimitive;
 import com.google.protobuf.Message;
 import io.grpc.Status;
 
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.Supplier;
+
 /**
  * Traduce entre el JSON de la cola y el contrato, y ejecuta la operación.
  *
@@ -51,6 +59,17 @@ public final class Ejecutor {
         }
     }
 
+    /**
+     * Los hilos donde corre la operación mientras el consumidor le mira el presupuesto.
+     * Son <b>daemon</b> a propósito: uno que se pasó del presupuesto no puede impedir que la
+     * JVM salga cuando el worker se apaga.
+     */
+    private static final ExecutorService RELOJ = Executors.newCachedThreadPool(tarea -> {
+        Thread hilo = new Thread(tarea, "presupuesto");
+        hilo.setDaemon(true);
+        return hilo;
+    });
+
     private final Operaciones operaciones;
 
     public Ejecutor(Operaciones operaciones) {
@@ -71,15 +90,16 @@ public final class Ejecutor {
         JsonObject parametros = tarea.parametros;
         switch (rpc) {
             case "Identidad":
-                return traducir(rpc, operaciones.identidad());
+                return conPresupuesto(tarea, rpc, operaciones::identidad);
             case "Salud":
-                return traducir(rpc, operaciones.salud());
+                return conPresupuesto(tarea, rpc, operaciones::salud);
             case "Echo":
-                return traducir(rpc, operaciones.echo(textoDe(parametros, "ping")));
+                return conPresupuesto(tarea, rpc,
+                        () -> operaciones.echo(textoDe(parametros, "ping")));
             case "ListarPersonas":
-                return traducir(rpc, operaciones.listarPersonas());
+                return conPresupuesto(tarea, rpc, operaciones::listarPersonas);
             case "CrearPersona":
-                return traducir(rpc, operaciones.crearPersona(
+                return conPresupuesto(tarea, rpc, () -> operaciones.crearPersona(
                         textoDe(parametros, "nombre"), legajoDe(parametros)));
             default:
                 // UNIMPLEMENTED y no un error genérico: le dice al equipo de la cola que el
@@ -87,6 +107,53 @@ public final class Ejecutor {
                 // no en la red ni en los datos. Reintentarlo no va a cambiar nada.
                 return new Resuelta(Status.Code.UNIMPLEMENTED.name(),
                         error("operación no reconocida: " + tarea.operacion), rpc, null);
+        }
+    }
+
+    /**
+     * Ejecuta la operación sin pasarse de {@code quedaMs}.
+     *
+     * <p>El presupuesto lo calcula la cola con <b>su</b> reloj y viaja como una duración, no
+     * como un instante: los relojes de las casas no están sincronizados, y una máquina
+     * adelantada dos segundos descartaría pedidos vivos si comparara contra un {@code
+     * vence_en}.
+     *
+     * <p>Es un límite a la <b>espera</b>, no una interrupción: la operación que se pasó sigue
+     * corriendo hasta terminar. No se la corta a propósito — cortarle el hilo a un alta a
+     * mitad de camino dejaría la base a medias, que es peor que una respuesta tardía. Lo que
+     * se corta es el worker esperándola: pasado el presupuesto la respuesta ya no le sirve a
+     * nadie, y este consumidor tiene que volver a tomar trabajo en vez de quedarse colgado.
+     *
+     * <p>Con las operaciones de este servicio el caso no debería darse nunca —son lecturas y
+     * un script Lua contra Redis, con el pool cortando a 1 s— así que esto es una red, no un
+     * camino habitual. Existe porque el contrato lo pide y porque una base lenta no tiene por
+     * qué dejar a un consumidor fuera de combate.
+     */
+    private Resuelta conPresupuesto(Tarea tarea, String rpc,
+                                    Supplier<Operaciones.Resultado> operacion) {
+        if (tarea.quedaMs == Tarea.SIN_PRESUPUESTO) {
+            return traducir(rpc, operacion.get());
+        }
+        Future<Operaciones.Resultado> enCurso = RELOJ.submit(operacion::get);
+        try {
+            return traducir(rpc, enCurso.get(tarea.quedaMs, TimeUnit.MILLISECONDS));
+        } catch (TimeoutException e) {
+            System.out.println("[worker] la " + tarea + " se pasó de los " + tarea.quedaMs
+                    + "ms de presupuesto: la respuesta ya no le sirve a nadie");
+            return new Resuelta(Status.Code.DEADLINE_EXCEEDED.name(),
+                    error("la operación no terminó dentro del presupuesto del pedido"), rpc, null);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new Resuelta(Status.Code.UNAVAILABLE.name(),
+                    error("el worker se está apagando"), rpc, null);
+        } catch (ExecutionException e) {
+            // La operación explotó. Se propaga como venía: el que la envuelve en un código
+            // del contrato es Worker, que ya sabe no matar al consumidor por esto.
+            Throwable causa = e.getCause();
+            if (causa instanceof RuntimeException) {
+                throw (RuntimeException) causa;
+            }
+            throw new IllegalStateException(causa);
         }
     }
 
@@ -212,10 +279,19 @@ public final class Ejecutor {
     // --- mensajes del contrato -> JSON -------------------------------------------------
 
     /**
-     * Los nombres de los campos salen del .proto <b>tal cual</b>: {@code servido_por} y no
-     * {@code servidoPor}. Es el mismo criterio que el resto del contrato —el .proto manda—
-     * y deja el sobre de la cola, que usa camelCase para lo suyo ({@code quedaMs},
-     * {@code atendidoPor}), claramente separado del contenido, que es nuestro.
+     * Los nombres de los campos van en <b>camelCase</b>: {@code servidoPor}, no
+     * {@code servido_por}.
+     *
+     * <p>No es una preferencia de estilo: este objeto es <b>exactamente</b> lo que el
+     * balanceador le publica al cliente final, sin tocar nada — el contrato público lo
+     * documenta campo por campo. Mandar los nombres del {@code .proto} tal cual haría que la
+     * misma operación se viera distinta según qué réplica la atendió, que es justo lo que las
+     * dos implementaciones existen para evitar. El {@code .proto} sigue mandando adentro; la
+     * conversión a camelCase pasa acá, en la frontera, y en un solo lugar.
+     *
+     * <p>{@code servidoPor} lo lleva también {@code Identidad}, aunque el mensaje del
+     * {@code .proto} no tenga ese campo: el contrato público lo lista y sale de lo mismo que
+     * los demás.
      */
     private static JsonObject contenidoDe(Message mensaje) {
         JsonObject o = new JsonObject();
@@ -236,6 +312,7 @@ public final class Ejecutor {
             o.addProperty("mensaje", i.getMensaje());
             o.addProperty("host", i.getHost());
             o.addProperty("arrancado", i.getArrancado());
+            o.addProperty("servidoPor", Config.APP);
         } else if (mensaje instanceof EstadoSalud) {
             EstadoSalud s = (EstadoSalud) mensaje;
             // El nombre del enumerado y no su número: "SANO" es legible en el sobre y no se
@@ -246,11 +323,11 @@ public final class Ejecutor {
         } else if (mensaje instanceof PongRespuesta) {
             PongRespuesta p = (PongRespuesta) mensaje;
             o.addProperty("pong", p.getPong());
-            o.addProperty("servido_por", p.getServidoPor());
+            o.addProperty("servidoPor", p.getServidoPor());
             o.addProperty("version", p.getVersion());
         } else if (mensaje instanceof ListaPersonas) {
             ListaPersonas l = (ListaPersonas) mensaje;
-            o.addProperty("servido_por", l.getServidoPor());
+            o.addProperty("servidoPor", l.getServidoPor());
             JsonArray personas = new JsonArray();
             for (Persona p : l.getPersonasList()) {
                 personas.add(dePersona(p));
@@ -258,7 +335,7 @@ public final class Ejecutor {
             o.add("personas", personas);
         } else if (mensaje instanceof RespuestaPersona) {
             RespuestaPersona r = (RespuestaPersona) mensaje;
-            o.addProperty("servido_por", r.getServidoPor());
+            o.addProperty("servidoPor", r.getServidoPor());
             o.add("persona", dePersona(r.getPersona()));
         }
         return o;
